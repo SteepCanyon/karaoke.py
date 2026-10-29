@@ -1,0 +1,10 @@
+build/
+dist/
+*.spec
+KaraokeDownloads/
+*.bak*
+__pycache__/
+.DS_Store
+*.dmg
+*.icns
+*.iconset/
