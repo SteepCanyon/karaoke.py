@@ -3,8 +3,12 @@ dist/
 *.spec
 KaraokeDownloads/
 *.bak*
-__pycache__/
-.DS_Store
+*рабочий*
+*версия*
+*.DS_Store
 *.dmg
-*.icns
 *.iconset/
+ЛОГО*
+*.jpg
+*.jpeg
+__pycache__/
