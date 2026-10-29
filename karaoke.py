@@ -286,30 +286,55 @@ class KaraokeApp:
 
     def _check_for_updates(self):
         """Фоновая проверка обновлений через GitHub Releases."""
-        if GITHUB_REPO == "yourname/karaoke-player":
-            return  # репозиторий не настроен
+        print("[update] Проверка запущена...")
+        if not GITHUB_REPO:
+            print("[update] GITHUB_REPO пустой, пропускаю")
+            return
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        headers = {"User-Agent": f"KaraokePlayer/{APP_VERSION}"}
+        r = None
+        if self.proxy_url:
+            try:
+                r = requests.get(
+                    url,
+                    proxies={"http": self.proxy_url, "https": self.proxy_url},
+                    timeout=10, headers=headers,
+                )
+                print(f"[update] via proxy: HTTP {r.status_code}")
+            except Exception as e:
+                print(f"[update] proxy failed: {type(e).__name__}: {e}")
+                r = None
+        if r is None or r.status_code != 200:
+            try:
+                r = requests.get(url, timeout=10, headers=headers)
+                print(f"[update] direct: HTTP {r.status_code}")
+            except Exception as e:
+                print(f"[update] direct failed: {type(e).__name__}: {e}")
+                return
+        if r.status_code != 200:
+            print(f"[update] GitHub API: HTTP {r.status_code}")
+            return
         try:
-            proxies = None
-            if self.proxy_url:
-                proxies = {"http": self.proxy_url, "https": self.proxy_url}
-            r = requests.get(
-                f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
-                proxies=proxies, timeout=10
-            )
-            if r.status_code != 200:
-                return
             data = r.json()
-            latest = data.get("tag_name", "").lstrip("v")
-            if not latest:
-                return
-            # Простое сравнение версий (1.0.0 < 1.0.1)
-            def ver_tuple(v):
-                return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
-            if ver_tuple(latest) > ver_tuple(APP_VERSION):
-                url = data.get("html_url", "")
-                self.root.after(0, lambda u=url, lv=latest: self._show_update_notice(u, lv))
         except Exception as e:
-            print(f"[update] Ошибка проверки: {e}")
+            print(f"[update] JSON parse failed: {e}")
+            return
+        latest = (data.get("tag_name") or "").lstrip("v")
+        if not latest:
+            return
+
+        def ver_tuple(v):
+            parts = [int(x) for x in re.findall(r"\d+", v)[:3]]
+            while len(parts) < 3:
+                parts.append(0)
+            return tuple(parts)
+
+        if ver_tuple(latest) > ver_tuple(APP_VERSION):
+            url_html = data.get("html_url", "")
+            self.root.after(0, lambda u=url_html, lv=latest: self._show_update_notice(u, lv))
+            print(f"[update] Доступна версия {latest}")
+        else:
+            print(f"[update] Установлена последняя версия ({APP_VERSION})")
 
     def _show_update_notice(self, url, latest_version):
         """Показывает ненавязчивое уведомление в статус-баре."""
