@@ -54,7 +54,7 @@ except ImportError:
 TPWS_PROXY = "socks5h://127.0.0.1:9876"
 
 APP_VERSION = "1.0.0"
-GITHUB_REPO = "aokraynov-commits/karaoke.py"  # <-- замените на ваш репозиторий
+GITHUB_REPO = "SteepCanyon/karaoke.py"  # <-- замените на ваш репозиторий
 
 TPWS_PORT = 9876
 

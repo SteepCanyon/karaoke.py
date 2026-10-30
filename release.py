@@ -7,7 +7,7 @@ PROJECT_DIR = Path.home() / "Desktop" / "Karaoke"
 KARAOKE_PY = PROJECT_DIR / "karaoke.py"
 PYTHON = "/opt/local/bin/python3.12"
 VLC_LIB = "/Applications/VLC.app/Contents/MacOS/lib"
-GITHUB_REPO = "aokraynov-commits/karaoke.py"
+GITHUB_REPO = "SteepCanyon/karaoke.py"
 
 
 def run(cmd, env=None, check=True):
