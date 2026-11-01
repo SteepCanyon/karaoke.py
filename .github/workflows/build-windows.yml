@@ -1,0 +1,50 @@
+name: Build Windows
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller python-vlc yt-dlp requests packaging PySocks
+      - name: Build .exe
+        run: |
+          pyinstaller --windowed --name "KaraokePlayer" ^
+            --add-data "zapret\tpws\tpws.exe;zapret\tpws" ^
+            --add-data "ffmpeg\ffmpeg.exe;ffmpeg" ^
+            --hidden-import vlc ^
+            --hidden-import yt_dlp ^
+            --hidden-import socks ^
+            --hidden-import sockshandler ^
+            karaoke.py
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          @"
+          [Setup]
+          AppName=KaraokePlayer
+          AppVersion=${{ github.ref_name }}
+          DefaultDirName={autopf}\KaraokePlayer
+          DefaultGroupName=KaraokePlayer
+          OutputBaseFilename=KaraokePlayer-Setup-${{ github.ref_name }}
+          Compression=lzma
+          SolidCompression=yes
+          [Files]
+          Source: "dist\KaraokePlayer\*"; DestDir: "{app}"; Flags: recursesubdirs
+          [Icons]
+          Name: "{group}\KaraokePlayer"; Filename: "{app}\KaraokePlayer.exe"
+          "@ | Out-File -Encoding ASCII installer.iss
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+      - name: Attach to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Output\KaraokePlayer-Setup-*.exe
