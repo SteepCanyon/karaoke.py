@@ -12,3 +12,4 @@ KaraokeDownloads/
 *.jpg
 *.jpeg
 __pycache__/
+bundle_env/
