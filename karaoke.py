@@ -53,7 +53,7 @@ except ImportError:
 
 TPWS_PROXY = "socks5h://127.0.0.1:9876"
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 GITHUB_REPO = "SteepCanyon/karaoke.py"  # <-- замените на ваш репозиторий
 
 TPWS_PORT = 9876
@@ -200,7 +200,6 @@ class TpwsProcess:
 class KaraokeApp:
     def __init__(self, root):
         self.root = root
-        self.cookies_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'www.youtube.com_cookies.txt')
         
         # --- ЗАПУСК NODE.JS СЕРВЕРА ---
         self.node_process = None
@@ -423,7 +422,7 @@ class KaraokeApp:
         if filepath:
             import shutil
             try:
-                shutil.copy2(filepath, self.cookies_file)
+                pass
                 self.status_lbl.config(text="✅ Cookies загружены!", fg="#00cc66")
             except Exception as e:
                 messagebox.showerror("Ошибка", f"Не удалось: {e}")
@@ -1135,11 +1134,10 @@ class KaraokeApp:
         url = f"https://youtu.be/{video_id}"
         outtmpl = os.path.join(self.temp_dir, '%(title)s.%(ext)s')
         
-        plugin_dir = resource_path("yt_dlp_plugins")
+        # РАБОЧАЯ КОМАНДА С ЧТЕНИЕМ ИЗ CHROME
         cmd = [
             "/opt/local/bin/python3.12", "-m", "yt_dlp",
-            "--plugin-dirs", plugin_dir,
-            "--cookies", self.cookies_file,
+            "--cookies-from-browser", "chrome",
             "--remote-components", "ejs:github",
             "--extractor-args", "youtube:player_client=web_creator",
             "--force-ipv4",
