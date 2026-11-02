@@ -76,6 +76,9 @@ def build():
         "--windowed", "--name", "KaraokePlayer",
         "--osx-bundle-identifier", "com.suncho.karaokeplayer",
         "--add-data", "zapret/tpws/tpws:zapret/tpws",
+        "--add-data", "bundle_env/node_server:node_server",
+        "--add-data", "bundle_env/yt_dlp_plugins:yt_dlp_plugins",
+        "--add-binary", "bundle_env/node_server/node:node_server",
         "--hidden-import", "vlc",
         "--hidden-import", "yt_dlp",
     ]

@@ -53,7 +53,7 @@ except ImportError:
 
 TPWS_PROXY = "socks5h://127.0.0.1:9876"
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 GITHUB_REPO = "SteepCanyon/karaoke.py"  # <-- замените на ваш репозиторий
 
 TPWS_PORT = 9876
@@ -200,6 +200,33 @@ class TpwsProcess:
 class KaraokeApp:
     def __init__(self, root):
         self.root = root
+        self.cookies_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'www.youtube.com_cookies.txt')
+        
+        # --- ЗАПУСК NODE.JS СЕРВЕРА ---
+        self.node_process = None
+        node_server_dir = resource_path("node_server")
+        main_js = os.path.join(node_server_dir, "build/main.js")
+        
+        if os.path.exists(main_js):
+            try:
+                if getattr(sys, 'frozen', False):
+                    node_server_dir = resource_path("node_server")
+                    node_bin = os.path.join(node_server_dir, "node")
+                else:
+                    node_bin = "/usr/local/bin/node"
+
+                self.node_process = subprocess.Popen(
+                    [node_bin, "build/main.js"], 
+                    cwd=node_server_dir,
+                    stdout=subprocess.DEVNULL, 
+                    stderr=subprocess.DEVNULL
+                )
+                print("[POT] Node.js сервер успешно запущен из приложения!")
+            except Exception as e:
+                print(f"[POT] ОШИБКА ЗАПУСКА NODE.JS: {e}")
+        else:
+            print(f"[POT] Не найден файл сервера: {main_js}")
+        # ------------------------------
         self.root.title("Караоке-плеер")
         self.root.geometry("1200x750+100+100")
         self.root.configure(bg="#0a0a0a")
@@ -367,6 +394,60 @@ class KaraokeApp:
         return False
 
     # ---------- UI ----------
+    def _wait_for_pot(self):
+        import urllib.request
+        import urllib.error
+        import time
+        print("[POT] Ожидание запуска Node.js сервера...")
+        for _ in range(15): # Ждем до 15 секунд
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:4416/ping", timeout=1) as response:
+                    if response.status == 200:
+                        print("[POT] Сервер готов к работе!")
+                        return True
+            except Exception:
+                pass
+            time.sleep(1)
+        print("[POT] Внимание: сервер не ответил, пробуем продолжить...")
+        return False
+
+    def _progress_hook(self, d):
+        if d['status'] == 'downloading':
+            print(f"\r[Скачивание] {d.get('_percent_str', '0%').strip()} | {d.get('_speed_str', 'N/A').strip()}", end="", flush=True)
+        elif d['status'] == 'finished':
+            print("\n[Скачивание] Завершено, идет склейка...")
+
+    def _load_cookies(self):
+        from tkinter import filedialog
+        filepath = filedialog.askopenfilename(title="cookies.txt", filetypes=[("Cookies", "*.txt"), ("All", "*.*")])
+        if filepath:
+            import shutil
+            try:
+                shutil.copy2(filepath, self.cookies_file)
+                self.status_lbl.config(text="✅ Cookies загружены!", fg="#00cc66")
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось: {e}")
+
+    def _get_ytdlp_cookies_opt(self):
+        if hasattr(self, 'cookies_file') and os.path.exists(self.cookies_file):
+            return {'cookiefile': self.cookies_file}
+        return {}
+
+    def _filter_local_files(self, event=None):
+        self._render_local_files()
+
+    def _render_local_files(self):
+        self.results_list.delete(0, tk.END)
+        self.last_results = []
+        query = self.local_search_entry.get().strip().lower() if hasattr(self, 'local_search_entry') else ""
+        count = 0
+        for f, path in getattr(self, 'all_local_files', []):
+            if query and query not in f.lower(): continue
+            self.results_list.insert(tk.END, f"  {f[:36]}{'...' if len(f)>36 else ''}")
+            self.last_results.append((f, path))
+            count += 1
+        self.status_lbl.config(text=f"Локальных: {count}", fg="#888")
+
     def create_widgets(self):
         bg = "#0a0a0a"
         fg = "#e0e0e0"
@@ -419,6 +500,12 @@ class KaraokeApp:
                                   font=("Segoe UI", 10, "bold"), relief=tk.FLAT,
                                   command=self.stop_search_command, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT)
+
+        self.local_search_frame = tk.Frame(right, bg=bg)
+        tk.Label(self.local_search_frame, text="🔍 Поиск в локальных", fg=fg, bg=bg, font=("Segoe UI", 10, "bold")).pack(anchor=tk.W)
+        self.local_search_entry = tk.Entry(self.local_search_frame, bg=entry_bg, fg=fg, insertbackground=fg, relief=tk.FLAT)
+        self.local_search_entry.pack(fill=tk.X, ipady=4, pady=5)
+        self.local_search_entry.bind("<KeyRelease>", self._filter_local_files)
 
         status_frame = tk.Frame(right, bg=bg)
         status_frame.pack(fill=tk.X, pady=5)
@@ -532,6 +619,36 @@ class KaraokeApp:
             pass
 
     # ---------- Видео-окно ----------
+    def _get_screens(self):
+        if not IS_MAC: return None
+        try:
+            from AppKit import NSScreen
+            return [{'x': int(s.frame().origin.x), 'y': int(s.frame().origin.y), 'w': int(s.frame().size.width), 'h': int(s.frame().size.height)} for s in NSScreen.screens()]
+        except Exception: return None
+
+    def _toggle_projector(self):
+        if getattr(self, 'projector_mode', False): self._return_from_projector()
+        else: self._send_to_projector()
+
+    def _send_to_projector(self):
+        screens = self._get_screens()
+        if not screens or len(screens) < 2:
+            messagebox.showerror("Ошибка", "Второй экран не найден или нужен pyobjc")
+            return
+        main_idx = 0
+        for i, s in enumerate(screens):
+            if s['x'] == 0 and s['y'] == 0: main_idx = i; break
+        target = next((s for i, s in enumerate(screens) if i != main_idx), None)
+        if not target: return
+        self.video_window.geometry(f"{target['w']}x{target['h']}+{target['x']}+{target['y']}")
+        self.projector_mode = True
+        self.projector_btn.config(text="📺 Вернуть", bg="#aa4444")
+
+    def _return_from_projector(self):
+        self.projector_mode = False
+        self.projector_btn.config(text="📺 На проектор", bg="#555")
+        self._position_video_window()
+
     def _create_video_window(self):
         self.video_window = tk.Toplevel(self.root)
         self.video_window.configure(bg="black")
@@ -924,20 +1041,15 @@ class KaraokeApp:
         idx = sel[0]
         if idx < len(self.last_results):
             vid = self.last_results[idx][1]
-            if not self._is_youtube_id(vid):
-                messagebox.showerror(
-                    "Ошибка",
-                    "В списке не YouTube-трек. Сделайте новый поиск.")
+            if not re.match(r'^[A-Za-z0-9_-]{11}$', vid):
+                messagebox.showerror("Ошибка", "Некорректный трек. Сделайте новый поиск.")
                 return
-            existing = self._check_already_downloaded(vid)
-            if existing:
-                self.status_lbl.config(
-                    text=f"Уже в библиотеке: {os.path.basename(existing)}", fg="#00cc66")
+            if self.video_cache.get(vid) and os.path.exists(self.video_cache[vid]):
+                self.status_lbl.config(text="Уже в библиотеке", fg="#00cc66")
                 return
             self.status_lbl.config(text="Скачивание...", fg="#00cc66")
-            self.download_btn.config(state=tk.DISABLED)
-            threading.Thread(target=self._download_to_library,
-                             args=(vid,), daemon=True).start()
+            threading.Thread(target=self._download, args=(vid, False), daemon=True).start()
+
 
     def _find_video_id_by_path(self, path):
         """Ищет video_id для файла, если он есть в кэше."""
@@ -987,77 +1099,7 @@ class KaraokeApp:
             return cached
         return None
 
-    def _download_to_library(self, video_id):
-        if not self._is_youtube_id(video_id):
-            self.root.after(0, lambda: self.status_lbl.config(
-                text="Неверный video_id", fg="red"))
-            return
-        url = f"https://youtu.be/{video_id}"
-        ydl_opts = {
-            'quiet': True,
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-            'outtmpl': os.path.join(self.temp_dir, '%(title)s.%(ext)s'),
-            'merge_output_format': 'mp4',
-            'ffmpeg_location': self.ffmpeg_path,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-                              'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
-            },
-            'no_warnings': True,
-            'proxy': self.proxy_url,
-            'extractor_args': {'youtube': {'player_client': ['android', 'web_embedded']}},
-        }
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Сначала проверяем по метаданным (без скачивания)
-                probe_opts = dict(ydl_opts)
-                probe_opts['skip_download'] = True
-                with yt_dlp.YoutubeDL(probe_opts) as ydl_probe:
-                    probe_info = ydl_probe.extract_info(url, download=False)
-                existing = self._check_already_downloaded(video_id, probe_info)
-                if existing:
-                    self.video_cache[video_id] = existing
-                    self._save_cache()
-                    self.root.after(0, lambda n=os.path.basename(existing):
-                                    self.status_lbl.config(
-                                        text=f"Уже в библиотеке: {n}", fg="#00cc66"))
-                    return
 
-                info = ydl.extract_info(url, download=True)
-                temp_path = self._resolve_downloaded_path(ydl, info)
-                if not temp_path:
-                    raise RuntimeError("Скачано, но файл не найден")
-
-                # Проверка по имени (страховка на случай дубля)
-                base_name = os.path.basename(temp_path)
-                existing = self._check_already_downloaded(video_id, info)
-                if existing:
-                    # На всякий случай удаляем скачанный временный
-                    try:
-                        os.remove(temp_path)
-                    except Exception:
-                        pass
-                    self.video_cache[video_id] = existing
-                    self._save_cache()
-                    self.root.after(0, lambda n=os.path.basename(existing):
-                                    self.status_lbl.config(
-                                        text=f"Уже в библиотеке: {n}", fg="#00cc66"))
-                    return
-
-                new_name = self._numbered_name(base_name)
-                dest = os.path.join(self.download_folder, new_name)
-                shutil.move(temp_path, dest)
-                self.video_cache[video_id] = dest
-                self._save_cache()
-                self.root.after(0, lambda n=new_name:
-                                self.status_lbl.config(text=f"Сохранено: {n}", fg="#00cc66"))
-        except Exception as e:
-            self.root.after(0, lambda err=str(e):
-                            self.status_lbl.config(text=f"Ошибка: {err}", fg="red"))
-        finally:
-            self.root.after(0, lambda: self.download_btn.config(state=tk.NORMAL))
-
-    # ---------- Воспроизведение ----------
     def _is_youtube_id(self, vid):
         """True, если строка похожа на YouTube video_id (11 символов)."""
         if not isinstance(vid, str):
@@ -1072,78 +1114,83 @@ class KaraokeApp:
             messagebox.showwarning("Не выбрано", "Выберите трек")
             return
         idx = sel[0]
-        if idx >= len(self.last_results):
-            return
-        item = self.last_results[idx][1]
-        if mode == "youtube":
-            # Защита: если это не YouTube ID, а путь — играем как локальный
-            if not self._is_youtube_id(item):
-                if os.path.exists(item):
-                    self._play_local(item)
-                else:
-                    messagebox.showerror(
-                        "Ошибка",
-                        "Некорректный трек. Сделайте новый поиск в YouTube.")
-                return
-            cached = self.video_cache.get(item)
-            if cached and os.path.exists(cached):
-                self.status_lbl.config(text="Из библиотеки", fg="#00cc66")
-                self._play_local(cached)
-                return
-            self.status_lbl.config(text="Загрузка...", fg="#00cc66")
-            threading.Thread(target=self._download_and_play,
-                             args=(item,), daemon=True).start()
-        else:
-            self._play_local(item)
+        if idx < len(self.last_results):
+            item = self.last_results[idx][1]
+            if mode == "youtube":
+                if not re.match(r'^[A-Za-z0-9_-]{11}$', item):
+                    messagebox.showerror("Ошибка", "Некорректный трек. Сделайте новый поиск.")
+                    return
+                cached = self.video_cache.get(item)
+                if cached and os.path.exists(cached):
+                    self.status_lbl.config(text="Из библиотеки", fg="#00cc66")
+                    self._play_local(cached)
+                    return
+                self.status_lbl.config(text="Загрузка...", fg="#00cc66")
+                threading.Thread(target=self._download, args=(item, True), daemon=True).start()
+            else:
+                self._play_local(item)
 
-    def _download_and_play(self, video_id):
-        if not self._is_youtube_id(video_id):
-            self.root.after(0, lambda: self.status_lbl.config(
-                text="Неверный video_id", fg="red"))
-            return
+
+    def _download(self, video_id, auto_play):
         url = f"https://youtu.be/{video_id}"
-        ydl_opts = {
-            'quiet': True,
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-            'outtmpl': os.path.join(self.temp_dir, '%(title)s.%(ext)s'),
-            'merge_output_format': 'mp4',
-            'ffmpeg_location': self.ffmpeg_path,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-                              'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
-            },
-            'no_warnings': True,
-            'proxy': self.proxy_url,
-            'extractor_args': {'youtube': {'player_client': ['android', 'web_embedded']}},
-        }
+        outtmpl = os.path.join(self.temp_dir, '%(title)s.%(ext)s')
+        
+        plugin_dir = resource_path("yt_dlp_plugins")
+        cmd = [
+            "/opt/local/bin/python3.12", "-m", "yt_dlp",
+            "--plugin-dirs", plugin_dir,
+            "--cookies", self.cookies_file,
+            "--remote-components", "ejs:github",
+            "--extractor-args", "youtube:player_client=web_creator",
+            "--force-ipv4",
+            "-f", "bv*+ba/b",
+            "--no-part",
+            "-o", outtmpl,
+            url
+        ]
+        if self.proxy_url:
+            cmd.extend(["--proxy", self.proxy_url])
+
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                temp_path = self._resolve_downloaded_path(ydl, info)
-                if not temp_path:
-                    raise RuntimeError("Скачано, но файл не найден")
-                # Проверка на дубль по имени (страховка)
-                existing = self._check_already_downloaded(video_id, info)
-                if existing:
-                    try:
-                        os.remove(temp_path)
-                    except Exception:
-                        pass
-                    dest = existing
-                else:
-                    new_name = self._numbered_name(os.path.basename(temp_path))
-                    dest = os.path.join(self.download_folder, new_name)
-                    shutil.move(temp_path, dest)
-                self.video_cache[video_id] = dest
-                self._save_cache()
-                duration = info.get('duration', 0)
-                self.root.after(0, lambda p=dest: self._play_local(p))
-                # Обновляем список локальных
-                if self.mode.get() == "local":
-                    self.root.after(0, self.load_local_files)
+            print("")
+            print("[POT] Запуск скачивания: " + video_id)
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            
+            for line in process.stdout:
+                line = line.strip()
+                if "[download]" in line and "%" in line:
+                    print("[Скачивание] " + line, flush=True)
+                elif "ERROR" in line:
+                    print("[Ошибка] " + line, flush=True)
+            
+            process.wait()
+            if process.returncode != 0:
+                raise Exception("yt-dlp завершился с ошибкой")
+                
+            print("[Скачивание] Файл загружен, ищем на диске...")
+
+            downloaded_files = [os.path.join(self.temp_dir, f) for f in os.listdir(self.temp_dir) if f.endswith(('.mp4', '.mkv', '.webm'))]
+            if not downloaded_files:
+                raise Exception("Скачанный файл не найден")
+            
+            temp_path = max(downloaded_files, key=os.path.getmtime)
+            new_name = f"{self._get_next_number():02d} - {os.path.basename(temp_path)}"
+            dest = os.path.join(self.download_folder, new_name)
+            
+            shutil.move(temp_path, dest)
+            self.video_cache[video_id] = dest
+            self._save_cache()
+            
+            if auto_play:
+                self.root.after(0, lambda: self._play_local(dest))
+            else:
+                self.root.after(0, lambda: self.status_lbl.config(text=f"Сохранено: {new_name}", fg="#00cc66"))
+                
         except Exception as e:
-            self.root.after(0, lambda err=str(e):
-                            self.status_lbl.config(text=f"Ошибка: {err}", fg="red"))
+            print("")
+            print("[Ошибка скачивания] " + str(e))
+            self.root.after(0, lambda err=str(e): self.status_lbl.config(text=f"Ошибка: {err}", fg="red"))
+
 
     def _play_local(self, path):
         if not os.path.exists(path):
@@ -1286,27 +1333,16 @@ class KaraokeApp:
                 'quiet': True,
                 'extract_flat': True,
                 'no_warnings': True,
-                'proxy': self.proxy_url,
+                'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
             }
+            if self.proxy_url: opts['proxy'] = self.proxy_url.replace('socks5h://', 'socks5://')
+            opts['cookiesfrombrowser'] = ('chrome',)
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(f"ytsearch15:{query} караоке", download=False)
-                if self.stop_search.is_set():
-                    return
-                results = []
-                if info and 'entries' in info:
-                    for e in info['entries']:
-                        if self.stop_search.is_set():
-                            return
-                        if e.get('id'):
-                            title = e.get('title', '')
-                            results.append((title, e['id']))
-                self.root.after(0, lambda res=results: self._update_results(res))
-        except Exception as e:
-            err = str(e)
-            self.root.after(0, lambda msg=err:
-                            self.status_lbl.config(text=f"Ошибка поиска: {msg}", fg="red"))
-        finally:
-            self.root.after(0, self._search_finished)
+                results = [(e.get('title', '')[:45], e['id']) for e in info.get('entries', []) if e.get('id')]
+                self.root.after(0, lambda: self._update_results(results))
+        except Exception as e: self.root.after(0, lambda err=str(e): self.status_lbl.config(text=f"Ошибка: {err}", fg="red"))
+        finally: self.root.after(0, lambda: self.search_btn.config(state=tk.NORMAL, bg="#00cc66"))
 
     def _update_results(self, results):
         self.results_list.delete(0, tk.END)
