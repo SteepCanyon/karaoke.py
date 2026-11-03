@@ -77,7 +77,7 @@ except Exception as e:
 
 TPWS_PROXY = "socks5h://127.0.0.1:9876"
 TPWS_PORT = 9876
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.6"
 GITHUB_REPO = "SteepCanyon/karaoke.py"
 ZAPRET_DIR = r"C:\Zapret\Dev"
 ZAPRET_EXE_TARGET = os.path.join(ZAPRET_DIR, "Zapret.exe")
@@ -207,8 +207,13 @@ class KaraokeApp:
             try:
                 node_bin = "/usr/local/bin/node"
                 bundled_node = os.path.join(node_server_dir, "node")
-                if os.path.exists(bundled_node): node_bin = bundled_node
-                elif not os.path.exists(node_bin): node_bin = "node"
+                if os.path.exists(bundled_node): 
+                    node_bin = bundled_node
+                    # Принудительно выдаем права на запуск, если PyInstaller их сбил
+                    try: os.chmod(node_bin, 0o755)
+                    except Exception: pass
+                elif not os.path.exists(node_bin): 
+                    node_bin = "node"
 
                 self.node_process = subprocess.Popen([node_bin, "build/main.js"], cwd=node_server_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 print(f"[POT] Node.js сервер запущен из: {node_server_dir}")
@@ -558,37 +563,36 @@ class KaraokeApp:
         else:
             self._play_local(item)
 
+    def _progress_hook(self, d):
+        if d['status'] == 'downloading':
+            print(f"\r[Скачивание] {d.get('_percent_str', '0%').strip()} | {d.get('_speed_str', 'N/A').strip()}", end="", flush=True)
+        elif d['status'] == 'finished':
+            print("\n[Скачивание] Завершено, склеиваем...")
+
     def _download(self, video_id, auto_play):
         url = f"https://youtu.be/{video_id}"
         outtmpl = os.path.join(self.temp_dir, '%(title)s.%(ext)s')
         
-        cmd = [
-            "/opt/local/bin/python3.12", "-m", "yt_dlp",
-            "--cookies-from-browser", "chrome",
-            "--remote-components", "ejs:github",
-            "--extractor-args", "youtube:player_client=web_creator",
-            "--force-ipv4",
-            "-f", "bv*+ba/b",
-            "--no-part",
-            "-o", outtmpl,
-            url
-        ]
-        if self.proxy_url: cmd.extend(["--proxy", self.proxy_url])
+        ydl_opts = {
+            'quiet': True,
+            'format': 'bv*+ba/b',
+            'outtmpl': outtmpl,
+            'nopart': True,
+            'cookiesfrombrowser': ('chrome',),
+            'remote_components': ['ejs:github'],
+            'extractor_args': {'youtube': {'player_client': ['web_creator']}},
+            'source_address': '0.0.0.0', # Принудительный IPv4
+            'progress_hooks': [self._progress_hook]
+        }
+        if self.proxy_url:
+            ydl_opts['proxy'] = self.proxy_url.replace('socks5h://', 'socks5://')
 
         try:
             print("")
             print("[POT] Запуск скачивания: " + video_id)
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             
-            for line in process.stdout:
-                line = line.strip()
-                if "[download]" in line and "%" in line:
-                    print("[Скачивание] " + line, flush=True)
-                elif "ERROR" in line:
-                    print("[Ошибка] " + line, flush=True)
-            
-            process.wait()
-            if process.returncode != 0: raise Exception("yt-dlp завершился с ошибкой")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
                 
             print("[Скачивание] Файл загружен, ищем на диске...")
 
@@ -612,6 +616,7 @@ class KaraokeApp:
             print("")
             print("[Ошибка скачивания] " + str(e))
             self.root.after(0, lambda err=str(e): self.status_lbl.config(text=f"Ошибка: {err}", fg="red"))
+
 
     def _play_local(self, path):
         if not os.path.exists(path): return
