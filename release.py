@@ -65,12 +65,11 @@ def check_prerequisites():
 def build():
     env = os.environ.copy()
     env["DYLD_LIBRARY_PATH"] = VLC_LIB
+    import subprocess
     for p in ("build", "dist", "KaraokePlayer.spec"):
         fp = PROJECT_DIR / p
-        if fp.is_dir():
-            shutil.rmtree(fp)
-        elif fp.is_file():
-            fp.unlink()
+        if fp.exists():
+            subprocess.run(["rm", "-rf", str(fp)])
     cmd = [
         PYTHON, "-m", "PyInstaller",
         "--windowed", "--name", "KaraokePlayer",
