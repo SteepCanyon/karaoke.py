@@ -1,503 +1,326 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Караоке-плеер для macOS.
-- Видео — в отдельном Toplevel-окне поверх левой области (обход ограничения Tk/NSView).
-- Обход блокировок — внешний zapret-macos-easy (tpws на 127.0.0.1:9876).
-- Pitch shift (тональность) — через ffmpeg, требует ffmpeg в PATH.
-"""
-
 import os
 import sys
 import platform
 import socket
 import ctypes
 import json
-
-IS_MAC = platform.system() == "Darwin"
-
-if IS_MAC:
-    for _vlc_candidate in (
-        "/Applications/VLC.app/Contents/MacOS",
-        "/Applications/MacPorts/VLC.app/Contents/MacOS",
-    ):
-        if os.path.exists(f"{_vlc_candidate}/lib/libvlc.dylib"):
-            os.environ["DYLD_LIBRARY_PATH"] = f"{_vlc_candidate}/lib"
-            os.environ.setdefault("VLC_PLUGIN_PATH", f"{_vlc_candidate}/plugins")
-            break
-
-import tkinter as tk
-from tkinter import messagebox
-import requests
-import webbrowser
-import threading
 import re
 import atexit
 import shutil
 import time
 import tempfile
 import subprocess
+import threading
+import tkinter as tk
+from tkinter import messagebox
+import webbrowser
+import requests
+import logging
+import traceback
+
+IS_MAC = platform.system() == "Darwin"
+IS_WIN = platform.system() == "Windows"
+
+if IS_WIN:
+    LOG_DIR = r"C:\Users\Suncho\Desktop\karaoke_player_you_tube"
+else:
+    LOG_DIR = os.path.expanduser("~/Desktop/karaoke_player_you_tube")
 
 try:
-    import yt_dlp
-except ImportError:
-    print("Нет модуля yt-dlp. Установите: /opt/local/bin/python3.12 -m pip install yt-dlp")
-    sys.exit(1)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    LOG_FILE = os.path.join(LOG_DIR, "app.log")
+except Exception:
+    LOG_FILE = "app.log"
+
+logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s', encoding='utf-8')
+
+class StreamToLogger:
+    def __init__(self, logger, level): self.logger, self.level = logger, level
+    def write(self, buf):
+        for line in buf.rstrip().splitlines(): self.logger.log(self.level, line.rstrip())
+    def flush(self): pass
+
+sys.stdout = StreamToLogger(logging.getLogger("STDOUT"), logging.INFO)
+sys.stderr = StreamToLogger(logging.getLogger("STDERR"), logging.ERROR)
+
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logging.critical("НЕОБРАБОТАННОЕ ИСКЛЮЧЕНИЕ", exc_info=(exc_type, exc_value, exc_traceback))
+
+sys.excepthook = handle_exception
+threading.excepthook = lambda args: logging.critical("ОШИБКА В ПОТОКЕ", exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+if IS_MAC:
+    for _vlc_candidate in ("/Applications/VLC.app/Contents/MacOS", "/Applications/MacPorts/VLC.app/Contents/MacOS"):
+        if os.path.exists(f"{_vlc_candidate}/lib/libvlc.dylib"):
+            os.environ["DYLD_LIBRARY_PATH"] = f"{_vlc_candidate}/lib"
+            os.environ.setdefault("VLC_PLUGIN_PATH", f"{_vlc_candidate}/plugins")
+            break
+
+if IS_WIN:
+    for _vlc_win in (r"C:\Program Files\VideoLAN\VLC", r"C:\Program Files (x86)\VideoLAN\VLC"):
+        if os.path.exists(os.path.join(_vlc_win, "libvlc.dll")):
+            try: os.add_dll_directory(_vlc_win)
+            except Exception: pass
+            break
 
 try:
     import vlc
-except ImportError:
-    print("Нет модуля python-vlc. Установите: /opt/local/bin/python3.12 -m pip install python-vlc")
+    import yt_dlp
+except Exception as e:
+    logging.critical(f"Ошибка импорта: {e}")
     sys.exit(1)
 
-
 TPWS_PROXY = "socks5h://127.0.0.1:9876"
-
-APP_VERSION = "1.0.2"
-GITHUB_REPO = "SteepCanyon/karaoke.py"  # <-- замените на ваш репозиторий
-
 TPWS_PORT = 9876
-
+APP_VERSION = "1.0.3"
+GITHUB_REPO = "SteepCanyon/karaoke.py"
+ZAPRET_DIR = r"C:\Zapret\Dev"
+ZAPRET_EXE_TARGET = os.path.join(ZAPRET_DIR, "Zapret.exe")
 
 def resource_path(relative_path):
-    if getattr(sys, 'frozen', False):
-        return os.path.join(sys._MEIPASS, relative_path)
+    if getattr(sys, 'frozen', False): return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
 
-
 def find_ffmpeg():
-    bundled = resource_path(os.path.join("ffmpeg", "ffmpeg"))
-    if os.path.exists(bundled):
-        return bundled
+    names = ("ffmpeg.exe", "ffmpeg") if IS_WIN else ("ffmpeg",)
+    for n in names:
+        bundled = resource_path(os.path.join("ffmpeg", n))
+        if os.path.exists(bundled): return bundled
+    if IS_WIN:
+        for p in (r"C:\ffmpeg\bin\ffmpeg.exe", r"C:\Program Files\ffmpeg\bin\ffmpeg.exe"):
+            if os.path.exists(p): return p
     for p in ("/opt/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
-        if os.path.exists(p):
-            return p
+        if os.path.exists(p): return p
     return shutil.which("ffmpeg") or "ffmpeg"
 
+def is_admin():
+    try: return ctypes.windll.shell32.IsUserAnAdmin()
+    except: return False
 
-def _load_libtk():
-    """Загружает libtk по стандартным путям (fallback, если в процессе ещё нет Tk)."""
-    libtk_name = f"libtk{tk.TkVersion}.dylib"
-    candidates = []
-    # 1) Внутри .app (PyInstaller)
-    if hasattr(sys, "_MEIPASS"):
-        candidates.append(os.path.join(sys._MEIPASS, libtk_name))
-    if getattr(sys, "frozen", False):
-        exe_dir = os.path.dirname(sys.executable)
-        candidates.append(os.path.abspath(
-            os.path.join(exe_dir, "..", "Frameworks", libtk_name)))
-    # 2) Python framework
-    prefix = getattr(sys, "base_prefix", sys.prefix)
-    candidates.append(os.path.join(prefix, "lib", libtk_name))
-    # 3) MacPorts / Homebrew
-    candidates += [
-        f"/opt/local/lib/{libtk_name}",
-        f"/opt/homebrew/lib/{libtk_name}",
-        f"/usr/local/lib/{libtk_name}",
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                return ctypes.cdll.LoadLibrary(path)
-            except Exception:
-                continue
-    return None
+if IS_WIN and not is_admin():
+    script = os.path.abspath(sys.argv[0])
+    params = ' '.join([f'"{arg}"' if ' ' in arg else arg for arg in sys.argv[1:]])
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{script}" {params}', None, 1)
+    sys.exit(0)
 
-
-_libtk_cache = None
-
-def _get_libtk_handle():
-    """Возвращает handle на libtk БЕЗ повторной загрузки, если она уже в процессе."""
-    global _libtk_cache
-    if _libtk_cache is not None:
-        return _libtk_cache
-    # 1) Пытаемся взять символ из уже загруженной libtk в текущем процессе.
-    #    Tkinter._tkinter всегда линкуется с libtk, она уже в памяти.
+def install_zapret():
+    if not IS_WIN: return False
+    src = resource_path("zapret")
+    if not os.path.exists(src): return False
+    if os.path.exists(ZAPRET_EXE_TARGET): return True
     try:
-        proc = ctypes.CDLL(None)
-        _ = proc.TkMacOSXGetRootControl  # проверка: символ доступен?
-        _libtk_cache = proc
-        return _libtk_cache
-    except AttributeError:
-        pass
-    # 2) Fallback: явная загрузка (dev-режим, не PyInstaller)
-    _libtk_cache = _load_libtk()
-    return _libtk_cache
+        os.makedirs(ZAPRET_DIR, exist_ok=True)
+        for item in os.listdir(src):
+            s, d = os.path.join(src, item), os.path.join(ZAPRET_DIR, item)
+            if os.path.isdir(s): shutil.copytree(s, d, dirs_exist_ok=True)
+            else: shutil.copy2(s, d)
+        return os.path.exists(ZAPRET_EXE_TARGET)
+    except Exception: return False
 
-
-def get_nsview(tk_widget):
-    if not IS_MAC:
-        return None
-    handle = _get_libtk_handle()
-    if handle is None:
-        return None
-    try:
-        f = handle.TkMacOSXGetRootControl
-    except AttributeError:
-        return None
-    f.restype = ctypes.c_void_p
-    f.argtypes = (ctypes.c_void_p,)
-    try:
-        return f(ctypes.c_void_p(tk_widget.winfo_id()))
-    except Exception as e:
-        print(f"[NSView] {e}")
-        return None
-
+class ZapretProcess:
+    def __init__(self, exe_path):
+        self.exe_path, self.process, self.ready = exe_path, None, False
+    def start(self):
+        if not os.path.exists(self.exe_path): return False
+        try:
+            self.process = subprocess.Popen([self.exe_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if IS_WIN else 0)
+            time.sleep(1)
+            self.ready = True
+            return True
+        except Exception: return False
+    def shutdown(self):
+        if self.process:
+            self.process.terminate(); self.process = None; self.ready = False
 
 class TpwsProcess:
-    """Запускает встроенный tpws на 127.0.0.1:9876."""
-    def __init__(self, binary_path, port=9876):
-        self.binary_path = binary_path
-        self.port = port
-        self.process = None
-        self.ready = False
-
-    def is_available(self):
-        return os.path.exists(self.binary_path) and os.access(self.binary_path, os.X_OK)
-
+    def __init__(self, binary_path, port=TPWS_PORT):
+        self.binary_path, self.port, self.process, self.ready = binary_path, port, None, False
     def start(self):
-        if self.ready:
-            return True
-        if not self.is_available():
-            return False
+        if self.ready: return True
+        if not os.path.exists(self.binary_path): return False
         try:
-            cmd = [
-                self.binary_path,
-                "--socks",
-                "--bind-addr=127.0.0.1",
-                f"--port={self.port}",
-                "--split-pos=midsld",
-                "--oob",
-            ]
-            self.process = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            cmd = [self.binary_path, "--socks", "--bind-addr=127.0.0.1", f"--port={self.port}", "--split-pos=midsld", "--oob"]
+            self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             for _ in range(40):
                 time.sleep(0.1)
                 try:
                     with socket.create_connection(("127.0.0.1", self.port), timeout=0.3):
                         self.ready = True
                         return True
-                except OSError:
-                    continue
+                except OSError: continue
             return False
-        except Exception:
-            return False
-
+        except Exception: return False
     def shutdown(self):
         if self.process:
             try:
-                self.process.terminate()
-                self.process.wait(timeout=3)
-            except Exception:
-                try:
-                    self.process.kill()
-                except Exception:
-                    pass
+                self.process.terminate(); self.process.wait(timeout=3)
+            except Exception: pass
             self.process = None
         self.ready = False
 
+_libtk_cache = None
+def get_nsview(tk_widget):
+    global _libtk_cache
+    if not IS_MAC: return None
+    if _libtk_cache is None:
+        try:
+            libtk_name = f"libtk{tk.TkVersion}.dylib"
+            for path in [f"/opt/local/lib/{libtk_name}", f"/opt/homebrew/lib/{libtk_name}", f"/usr/local/lib/{libtk_name}"]:
+                if os.path.exists(path):
+                    _libtk_cache = ctypes.cdll.LoadLibrary(path)
+                    break
+        except Exception: pass
+    if _libtk_cache is None: return None
+    try:
+        f = _libtk_cache.TkMacOSXGetRootControl
+        f.restype = ctypes.c_void_p
+        f.argtypes = (ctypes.c_void_p,)
+        return f(ctypes.c_void_p(tk_widget.winfo_id()))
+    except Exception: return None
 
 class KaraokeApp:
     def __init__(self, root):
         self.root = root
-        
-        # --- ЗАПУСК NODE.JS СЕРВЕРА ---
-        self.node_process = None
-        node_server_dir = resource_path("node_server")
-        main_js = os.path.join(node_server_dir, "build/main.js")
-        
-        if os.path.exists(main_js):
-            try:
-                if getattr(sys, 'frozen', False):
-                    node_server_dir = resource_path("node_server")
-                    node_bin = os.path.join(node_server_dir, "node")
-                else:
-                    node_bin = "/usr/local/bin/node"
-
-                self.node_process = subprocess.Popen(
-                    [node_bin, "build/main.js"], 
-                    cwd=node_server_dir,
-                    stdout=subprocess.DEVNULL, 
-                    stderr=subprocess.DEVNULL
-                )
-                print("[POT] Node.js сервер успешно запущен из приложения!")
-            except Exception as e:
-                print(f"[POT] ОШИБКА ЗАПУСКА NODE.JS: {e}")
-        else:
-            print(f"[POT] Не найден файл сервера: {main_js}")
-        # ------------------------------
         self.root.title("Караоке-плеер")
-        self.root.geometry("1200x750+100+100")
+        self.root.geometry("1200x750")
         self.root.configure(bg="#0a0a0a")
 
-        if not os.path.exists("/Applications/VLC.app") and not os.path.exists("/Applications/MacPorts/VLC.app"):
-            messagebox.showerror("VLC не найден", "Установите VLC:\n    sudo port install VLC")
-            sys.exit(1)
+        # Запуск Node.js сервера
+        self.node_process = None
+        possible_dirs = [
+            resource_path("node_server"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "bundle_env", "node_server"),
+            os.path.expanduser("~/Desktop/bgutil-ytdlp-pot-provider/server")
+        ]
+        node_server_dir = None
+        for d in possible_dirs:
+            if os.path.exists(os.path.join(d, "build", "main.js")):
+                node_server_dir = d
+                break
+                
+        if node_server_dir:
+            try:
+                node_bin = "/usr/local/bin/node"
+                bundled_node = os.path.join(node_server_dir, "node")
+                if os.path.exists(bundled_node): node_bin = bundled_node
+                elif not os.path.exists(node_bin): node_bin = "node"
 
-        self.instance = vlc.Instance(
-            "--http-user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
-        )
-        self.player = self.instance.media_player_new()
+                self.node_process = subprocess.Popen([node_bin, "build/main.js"], cwd=node_server_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print(f"[POT] Node.js сервер запущен из: {node_server_dir}")
+            except Exception as e:
+                print(f"[POT] ОШИБКА: {e}")
+
+        self.zapret_process = None
+        self.tpws_process = None
+        self.proxy_url = None
+        self.projector_mode = False
+
+        if IS_WIN:
+            if not os.path.exists(ZAPRET_EXE_TARGET):
+                if not install_zapret(): sys.exit(1)
+            self.zapret_process = ZapretProcess(ZAPRET_EXE_TARGET)
+            self.zapret_process.start()
+        else:
+            if not os.path.exists("/Applications/VLC.app") and not os.path.exists("/Applications/MacPorts/VLC.app"):
+                messagebox.showerror("VLC не найден", "Установите VLC")
+                sys.exit(1)
+            bundled_tpws = resource_path(os.path.join("zapret", "tpws", "tpws"))
+            self.tpws_process = TpwsProcess(bundled_tpws, port=TPWS_PORT)
+            if self.tpws_process.start(): self.proxy_url = TPWS_PROXY
+            else: self._check_tpws()
+
+        try:
+            # Отключаем аппаратное декодирование, чтобы избежать зависаний на Mac
+            self.instance = vlc.Instance("--http-user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", "--avcodec-hw=none")
+            self.player = self.instance.media_player_new()
+        except Exception as e:
+            logging.critical(f"Ошибка VLC: {e}")
+            sys.exit(1)
 
         self.current_url = None
         self.current_original_path = None
         self.current_pitch = 0
-        self.projector_mode = False
-        self.current_video_id = None
         self.last_results = []
+        self.all_local_files = []
         self.mode = tk.StringVar(value="youtube")
 
-        # Всегда одна папка — независимо от dev/.app режима
-        base = os.path.join(os.path.expanduser("~"), "Music", "KaraokePlayer")
+        base = os.path.expanduser("~/Music/KaraokePlayer")
         self.download_folder = os.path.join(base, "KaraokeDownloads")
-        print(f"[folder] download_folder = {self.download_folder}")
         os.makedirs(self.download_folder, exist_ok=True)
 
         self.ffmpeg_path = find_ffmpeg()
         self.temp_dir = tempfile.mkdtemp(prefix="karaoke_")
-        self.current_temp_youtube = None
-
-        # Кэш video_id -> локальный путь
         self.cache_file = os.path.join(self.download_folder, ".cache.json")
         self.video_cache = self._load_cache()
-        self._clean_cache()  # удалить дубликаты и мёртвые записи при старте
-        # Кэш pitch: (path, semitones) -> temp-путь
         self.pitch_cache = {}
-
-        self.proxy_url = None
-        self._check_tpws()
-        # Фоновая проверка обновлений (не блокирует запуск)
-        threading.Thread(target=self._check_for_updates, daemon=True).start()
 
         self.progress_var = tk.DoubleVar(value=0.0)
         self.stop_progress = threading.Event()
-        self.progress_thread = threading.Thread(target=self.update_progress, daemon=True)
-        self.progress_thread.start()
+        threading.Thread(target=self.update_progress, daemon=True).start()
 
         self.search_thread = None
         self.stop_search = threading.Event()
 
-        # Lock и generation для безопасных VLC-операций
-        self._play_lock = threading.Lock()
-        self._play_generation = 0
-
         self.create_widgets()
         self._create_video_window()
-
+        
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        try:
-            self.root.createcommand("::tk::mac::Quit", self.on_closing)
-        except Exception:
-            pass
+        threading.Thread(target=self._check_for_updates, daemon=True).start()
 
-    # ---------- Cache ----------
     def _load_cache(self):
         try:
             if os.path.exists(self.cache_file):
-                with open(self.cache_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception:
-            pass
+                with open(self.cache_file, "r", encoding="utf-8") as f: return json.load(f)
+        except Exception: pass
         return {}
 
     def _save_cache(self):
         try:
-            with open(self.cache_file, "w", encoding="utf-8") as f:
-                json.dump(self.video_cache, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    # ---------- tpws ----------
-
-    def _check_for_updates(self):
-        """Фоновая проверка обновлений через GitHub Releases."""
-        print("[update] Проверка запущена...")
-        if not GITHUB_REPO:
-            print("[update] GITHUB_REPO пустой, пропускаю")
-            return
-        url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-        headers = {"User-Agent": f"KaraokePlayer/{APP_VERSION}"}
-        r = None
-        if self.proxy_url:
-            try:
-                r = requests.get(
-                    url,
-                    proxies={"http": self.proxy_url, "https": self.proxy_url},
-                    timeout=10, headers=headers,
-                )
-                print(f"[update] via proxy: HTTP {r.status_code}")
-            except Exception as e:
-                print(f"[update] proxy failed: {type(e).__name__}: {e}")
-                r = None
-        if r is None or r.status_code != 200:
-            try:
-                r = requests.get(url, timeout=10, headers=headers)
-                print(f"[update] direct: HTTP {r.status_code}")
-            except Exception as e:
-                print(f"[update] direct failed: {type(e).__name__}: {e}")
-                return
-        if r.status_code != 200:
-            print(f"[update] GitHub API: HTTP {r.status_code}")
-            return
-        try:
-            data = r.json()
-        except Exception as e:
-            print(f"[update] JSON parse failed: {e}")
-            return
-        latest = (data.get("tag_name") or "").lstrip("v")
-        if not latest:
-            return
-
-        def ver_tuple(v):
-            parts = [int(x) for x in re.findall(r"\d+", v)[:3]]
-            while len(parts) < 3:
-                parts.append(0)
-            return tuple(parts)
-
-        if ver_tuple(latest) > ver_tuple(APP_VERSION):
-            url_html = data.get("html_url", "")
-            self.root.after(0, lambda u=url_html, lv=latest: self._show_update_notice(u, lv))
-            print(f"[update] Доступна версия {latest}")
-        else:
-            print(f"[update] Установлена последняя версия ({APP_VERSION})")
-
-    def _show_update_notice(self, url, latest_version):
-        """Показывает ненавязчивое уведомление в статус-баре."""
-        try:
-            self.status_lbl.config(
-                text=f"Доступна версия {latest_version} → нажмите для скачивания",
-                fg="#ffaa00"
-            )
-            # При клике на статус открывается страница релиза
-            self.status_lbl.bind("<Button-1>", lambda e: webbrowser.open(url))
-        except Exception:
-            pass
+            with open(self.cache_file, "w", encoding="utf-8") as f: json.dump(self.video_cache, f, ensure_ascii=False, indent=2)
+        except Exception: pass
 
     def _check_tpws(self):
-        # 1) Уже запущенный tpws (zapret-macos-easy)
         try:
             with socket.create_connection(("127.0.0.1", TPWS_PORT), timeout=1.0):
                 self.proxy_url = TPWS_PROXY
-                self.tpws_process = None
                 return True
         except OSError:
-            pass
-        # 2) Пробуем запустить встроенный tpws
-        bundled = resource_path(os.path.join("zapret", "tpws", "tpws"))
-        self.tpws_process = TpwsProcess(bundled, port=TPWS_PORT)
-        if self.tpws_process.start():
-            self.proxy_url = TPWS_PROXY
-            return True
-        self.proxy_url = None
-        return False
-
-    # ---------- UI ----------
-    def _wait_for_pot(self):
-        import urllib.request
-        import urllib.error
-        import time
-        print("[POT] Ожидание запуска Node.js сервера...")
-        for _ in range(15): # Ждем до 15 секунд
-            try:
-                with urllib.request.urlopen("http://127.0.0.1:4416/ping", timeout=1) as response:
-                    if response.status == 200:
-                        print("[POT] Сервер готов к работе!")
-                        return True
-            except Exception:
-                pass
-            time.sleep(1)
-        print("[POT] Внимание: сервер не ответил, пробуем продолжить...")
-        return False
-
-    def _progress_hook(self, d):
-        if d['status'] == 'downloading':
-            print(f"\r[Скачивание] {d.get('_percent_str', '0%').strip()} | {d.get('_speed_str', 'N/A').strip()}", end="", flush=True)
-        elif d['status'] == 'finished':
-            print("\n[Скачивание] Завершено, идет склейка...")
-
-    def _load_cookies(self):
-        from tkinter import filedialog
-        filepath = filedialog.askopenfilename(title="cookies.txt", filetypes=[("Cookies", "*.txt"), ("All", "*.*")])
-        if filepath:
-            import shutil
-            try:
-                pass
-                self.status_lbl.config(text="✅ Cookies загружены!", fg="#00cc66")
-            except Exception as e:
-                messagebox.showerror("Ошибка", f"Не удалось: {e}")
-
-    def _get_ytdlp_cookies_opt(self):
-        if hasattr(self, 'cookies_file') and os.path.exists(self.cookies_file):
-            return {'cookiefile': self.cookies_file}
-        return {}
-
-    def _filter_local_files(self, event=None):
-        self._render_local_files()
-
-    def _render_local_files(self):
-        self.results_list.delete(0, tk.END)
-        self.last_results = []
-        query = self.local_search_entry.get().strip().lower() if hasattr(self, 'local_search_entry') else ""
-        count = 0
-        for f, path in getattr(self, 'all_local_files', []):
-            if query and query not in f.lower(): continue
-            self.results_list.insert(tk.END, f"  {f[:36]}{'...' if len(f)>36 else ''}")
-            self.last_results.append((f, path))
-            count += 1
-        self.status_lbl.config(text=f"Локальных: {count}", fg="#888")
+            self.proxy_url = None
+            return False
 
     def create_widgets(self):
-        bg = "#0a0a0a"
-        fg = "#e0e0e0"
-        accent = "#00cc66"
-        entry_bg = "#1a1a1a"
-        list_bg = "#111111"
+        bg, fg, accent, entry_bg, list_bg = "#0a0a0a", "#e0e0e0", "#00cc66", "#1a1a1a", "#111111"
 
         main = tk.Frame(self.root, bg=bg)
         main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         self.video_placeholder = tk.Frame(main, bg="black")
         self.video_placeholder.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-        tk.Label(self.video_placeholder, text="🎤", fg="#1a1a1a", bg="black",
-                 font=("Segoe UI", 96)).place(relx=0.5, rely=0.5, anchor=tk.CENTER)
-        self.placeholder_hint = tk.Label(
-            self.video_placeholder, text="Видео появится здесь",
-            fg="#333", bg="black", font=("Segoe UI", 12))
-        self.placeholder_hint.place(relx=0.5, rely=0.62, anchor=tk.CENTER)
-
+        
         right = tk.Frame(main, bg=bg, width=300)
         right.pack(side=tk.RIGHT, fill=tk.Y)
         right.pack_propagate(False)
 
         mode_frame = tk.Frame(right, bg=bg)
         mode_frame.pack(fill=tk.X, pady=(0, 5))
-        tk.Radiobutton(mode_frame, text="YouTube", variable=self.mode, value="youtube",
-                       command=self.on_mode_change, fg=fg, bg=bg, selectcolor=bg,
-                       activebackground=bg, activeforeground=fg,
-                       font=("Segoe UI", 9)).pack(side=tk.LEFT)
-        tk.Radiobutton(mode_frame, text="Локальные файлы", variable=self.mode, value="local",
-                       command=self.on_mode_change, fg=fg, bg=bg, selectcolor=bg,
-                       activebackground=bg, activeforeground=fg,
-                       font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=10)
+        tk.Radiobutton(mode_frame, text="YouTube", variable=self.mode, value="youtube", command=self.on_mode_change, fg=fg, bg=bg, selectcolor=bg).pack(side=tk.LEFT)
+        tk.Radiobutton(mode_frame, text="Локальные файлы", variable=self.mode, value="local", command=self.on_mode_change, fg=fg, bg=bg, selectcolor=bg).pack(side=tk.LEFT, padx=10)
 
         self.search_frame = tk.Frame(right, bg=bg)
-        tk.Label(self.search_frame, text="🔍 Поиск", fg=fg, bg=bg,
-                 font=("Segoe UI", 10, "bold")).pack(anchor=tk.W)
-        self.search_entry = tk.Entry(self.search_frame, bg=entry_bg, fg=fg,
-                                     font=("Segoe UI", 11), relief=tk.FLAT,
-                                     insertbackground=fg)
+        tk.Label(self.search_frame, text="🔍 Поиск", fg=fg, bg=bg, font=("Segoe UI", 10, "bold")).pack(anchor=tk.W)
+        self.search_entry = tk.Entry(self.search_frame, bg=entry_bg, fg=fg, insertbackground=fg, relief=tk.FLAT)
         self.search_entry.pack(fill=tk.X, ipady=4, pady=5)
         self.search_entry.bind('<Return>', lambda e: self.do_search())
         btn_frame = tk.Frame(self.search_frame, bg=bg)
         btn_frame.pack(fill=tk.X)
-        self.search_btn = tk.Button(btn_frame, text="Найти", bg=accent, fg="#000",
-                                    font=("Segoe UI", 10, "bold"), relief=tk.FLAT,
-                                    command=self.do_search)
+        self.search_btn = tk.Button(btn_frame, text="Найти", bg=accent, fg="#000", relief=tk.FLAT, command=self.do_search)
         self.search_btn.pack(side=tk.LEFT, padx=(0, 5))
-        self.stop_btn = tk.Button(btn_frame, text="⏹ Стоп", bg="#555", fg=fg,
-                                  font=("Segoe UI", 10, "bold"), relief=tk.FLAT,
-                                  command=self.stop_search_command, state=tk.DISABLED)
+        self.stop_btn = tk.Button(btn_frame, text="⏹ Стоп", bg="#555", fg=fg, relief=tk.FLAT, command=self.stop_search_command, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT)
 
         self.local_search_frame = tk.Frame(right, bg=bg)
@@ -508,121 +331,113 @@ class KaraokeApp:
 
         status_frame = tk.Frame(right, bg=bg)
         status_frame.pack(fill=tk.X, pady=5)
-        self.status_lbl = tk.Label(status_frame, text="Готов", fg="#888", bg=bg,
-                                   font=("Segoe UI", 9))
+        self.status_lbl = tk.Label(status_frame, text="Готов", fg="#888", bg=bg)
         self.status_lbl.pack(side=tk.LEFT)
-        self.zapret_status = tk.Label(status_frame, text="", fg=accent, bg=bg,
-                                      font=("Segoe UI", 9))
+        self.zapret_status = tk.Label(status_frame, text="", fg=accent, bg=bg)
         self.zapret_status.pack(side=tk.RIGHT)
         self.update_zapret_status()
 
-        tk.Label(right, text="🎵 Список", fg=fg, bg=bg,
-                 font=("Segoe UI", 10, "bold")).pack(anchor=tk.W, pady=(10, 0))
-        self.results_list = tk.Listbox(right, bg=list_bg, fg=fg,
-                                       font=("Menlo", 10), relief=tk.FLAT,
-                                       selectbackground=accent, selectforeground="#000",
-                                       height=10, width=30, highlightthickness=0)
+        tk.Label(right, text="🎵 Список", fg=fg, bg=bg, font=("Segoe UI", 10, "bold")).pack(anchor=tk.W, pady=(10, 0))
+        self.results_list = tk.Listbox(right, bg=list_bg, fg=fg, relief=tk.FLAT, selectbackground=accent, selectforeground="#000", height=8, width=30)
         self.results_list.pack(fill=tk.BOTH, expand=True, pady=5)
         self.results_list.bind('<Double-1>', lambda e: self.play_selected())
         self.results_list.bind('<<ListboxSelect>>', self._on_list_select)
 
-        # Кнопки управления
         ctrl_frame = tk.Frame(right, bg=bg)
         ctrl_frame.pack(fill=tk.X, pady=5)
-        # Порядок: 📥 Загрузить | ▶/⏸ | ⏹ | 🗑 (только в локальном режиме)
-        self.download_btn = tk.Button(ctrl_frame, text="📥", bg=accent, fg="#000",
-                                      font=("Segoe UI", 12, "bold"), relief=tk.FLAT,
-                                      command=self.download_selected, width=4)
+        self.download_btn = tk.Button(ctrl_frame, text="📥", bg=accent, fg="#000", font=("Segoe UI", 12, "bold"), relief=tk.FLAT, command=self.download_selected, width=4)
         self.download_btn.grid(row=0, column=0, padx=2)
-        self.play_pause_btn = tk.Button(ctrl_frame, text="▶", bg=accent, fg="#000",
-                                        font=("Segoe UI", 12, "bold"), relief=tk.FLAT,
-                                        command=self.toggle_play_pause, width=4)
+        self.play_pause_btn = tk.Button(ctrl_frame, text="▶", bg=accent, fg="#000", font=("Segoe UI", 12, "bold"), relief=tk.FLAT, command=self.toggle_play_pause, width=4)
         self.play_pause_btn.grid(row=0, column=1, padx=2)
-        self.stop_play_btn = tk.Button(ctrl_frame, text="⏹", bg=accent, fg="#000",
-                                       font=("Segoe UI", 12, "bold"), relief=tk.FLAT,
-                                       command=self.stop, width=4)
+        self.stop_play_btn = tk.Button(ctrl_frame, text="⏹", bg=accent, fg="#000", font=("Segoe UI", 12, "bold"), relief=tk.FLAT, command=self.stop, width=4)
         self.stop_play_btn.grid(row=0, column=2, padx=2)
-        self.delete_btn = tk.Button(ctrl_frame, text="🗑", bg="#cc3333", fg="#fff",
-                                    font=("Segoe UI", 12, "bold"), relief=tk.FLAT,
-                                    command=self.delete_selected_local, width=4)
+        self.delete_btn = tk.Button(ctrl_frame, text="🗑", bg="#cc3333", fg="#fff", font=("Segoe UI", 12, "bold"), relief=tk.FLAT, command=self.delete_selected_local, width=4)
         self.delete_btn.grid(row=0, column=3, padx=2)
         self.delete_btn.grid_remove()
 
-        # Прогресс
         progress_frame = tk.Frame(right, bg=bg)
         progress_frame.pack(fill=tk.X, pady=5)
-        tk.Label(progress_frame, text="Прогресс", fg=fg, bg=bg,
-                 font=("Segoe UI", 9)).pack(anchor=tk.W)
-        self.progress_scale = tk.Scale(progress_frame, from_=0, to=100,
-                                       orient=tk.HORIZONTAL, length=200,
-                                       variable=self.progress_var,
-                                       command=self.on_progress_move,
-                                       bg=bg, fg=fg, troughcolor="#333",
-                                       highlightthickness=0)
+        self.progress_scale = tk.Scale(progress_frame, from_=0, to=100, orient=tk.HORIZONTAL, variable=self.progress_var, command=self.on_progress_move, bg=bg, fg=fg, troughcolor="#333", highlightthickness=0)
         self.progress_scale.pack(fill=tk.X)
         self.progress_scale.bind("<ButtonRelease-1>", self.on_progress_release)
 
-        # Громкость
         vol_frame = tk.Frame(right, bg=bg)
         vol_frame.pack(fill=tk.X, pady=5)
-        tk.Label(vol_frame, text="🔊 Громкость", fg=fg, bg=bg,
-                 font=("Segoe UI", 9)).pack(anchor=tk.W)
-        self.vol_scale = tk.Scale(vol_frame, from_=0, to=200, orient=tk.HORIZONTAL,
-                                  length=200, command=self.on_volume_change,
-                                  bg=bg, fg=fg, troughcolor="#333",
-                                  highlightthickness=0)
+        tk.Label(vol_frame, text="🔊 Громкость", fg=fg, bg=bg).pack(anchor=tk.W)
+        self.vol_scale = tk.Scale(vol_frame, from_=0, to=200, orient=tk.HORIZONTAL, command=self.on_volume_change, bg=bg, fg=fg, troughcolor="#333", highlightthickness=0)
         self.vol_scale.set(100)
         self.vol_scale.pack(fill=tk.X)
-        self.vol_val = tk.Label(vol_frame, text="100%", fg=accent, bg=bg,
-                                font=("Segoe UI", 9))
-        self.vol_val.pack(anchor=tk.E)
 
-        # Тональность
         pitch_frame = tk.Frame(right, bg=bg)
         pitch_frame.pack(fill=tk.X, pady=5)
-        tk.Label(pitch_frame, text="🎚 Тональность (полутона)", fg=fg, bg=bg,
-                 font=("Segoe UI", 9)).pack(anchor=tk.W)
-        self.pitch_scale = tk.Scale(pitch_frame, from_=-6, to=6, orient=tk.HORIZONTAL,
-                                    length=200, bg=bg, fg=fg, troughcolor="#333",
-                                    highlightthickness=0, resolution=1)
-        self.pitch_scale.set(0)
+        tk.Label(pitch_frame, text="🎚 Тональность", fg=fg, bg=bg).pack(anchor=tk.W)
+        self.pitch_scale = tk.Scale(pitch_frame, from_=-6, to=6, orient=tk.HORIZONTAL, bg=bg, fg=fg, troughcolor="#333", highlightthickness=0, resolution=1)
         self.pitch_scale.pack(fill=tk.X)
-        self.pitch_val = tk.Label(pitch_frame, text="0", fg=accent, bg=bg,
-                                  font=("Segoe UI", 9))
-        self.pitch_val.pack(anchor=tk.E)
         self.pitch_scale.bind("<ButtonRelease-1>", self.on_pitch_release)
 
-        # Нижние кнопки
-        self.restart_zapret_btn = tk.Button(right, text="🔄 Проверить tpws",
-                                            bg=accent, fg="#000",
-                                            font=("Segoe UI", 9, "bold"),
-                                            relief=tk.FLAT, command=self.restart_zapret)
+        self.restart_zapret_btn = tk.Button(right, text="🔄 Проверить обход", bg=accent, fg="#000", relief=tk.FLAT, command=self.restart_zapret)
         self.restart_zapret_btn.pack(fill=tk.X, pady=(5, 2))
-        self.projector_btn = tk.Button(right, text="📺 На проектор",
-                                       bg="#555", fg=fg,
-                                       font=("Segoe UI", 9, "bold"),
-                                       relief=tk.FLAT, command=self._toggle_projector)
-        self.projector_btn.pack(fill=tk.X, pady=(0, 2))
-        self.open_folder_btn = tk.Button(right, text="📂 Открыть папку библиотеки",
-                                         bg="#333", fg=fg,
-                                         font=("Segoe UI", 9, "bold"),
-                                         relief=tk.FLAT, command=self._open_folder)
-        self.open_folder_btn.pack(fill=tk.X, pady=(0, 5))
+        
+        self.projector_btn = tk.Button(right, text="📺 На проектор", bg="#555", fg=fg, font=("Segoe UI", 9, "bold"), relief=tk.FLAT, command=self._toggle_projector)
+        self.projector_btn.pack(fill=tk.X, pady=(0, 5))
 
         self.on_mode_change()
 
-    def _open_folder(self):
-        try:
-            subprocess.run(["open", self.download_folder], check=False)
-        except Exception:
-            pass
+    # --- ВИДЕО ОКНО ---
+    def _create_video_window(self):
+        self.video_window = tk.Toplevel(self.root)
+        self.video_window.title("Karaoke Video")
+        self.video_window.configure(bg="black")
+        self.video_window.transient(self.root)
+        
+        self.video_canvas = tk.Canvas(self.video_window, bg="black", highlightthickness=0, bd=0)
+        self.video_canvas.pack(fill=tk.BOTH, expand=True)
+        
+        # Перехватываем крестик: скрываем окно, а не убиваем его
+        self.video_window.protocol("WM_DELETE_WINDOW", self.video_window.withdraw)
 
-    # ---------- Видео-окно ----------
+        self.root.bind("<Configure>", lambda e: self.root.after(50, self._position_video_window) if e.widget is self.root else None)
+        self.root.bind("<Unmap>", self._on_root_unmap)
+        self.root.bind("<Map>", self._on_root_map)
+        self.root.after(200, self._position_video_window)
+        self.root.after(500, self._attach_vlc)
+
+    def _position_video_window(self):
+        if getattr(self, 'projector_mode', False): return
+        try:
+            if not self.video_window.winfo_exists(): return
+            self.root.update_idletasks()
+            x, y = self.video_placeholder.winfo_rootx(), self.video_placeholder.winfo_rooty()
+            w, h = self.video_placeholder.winfo_width(), self.video_placeholder.winfo_height()
+            if w > 10 and h > 10:
+                self.video_window.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception: pass
+
+    def _attach_vlc(self):
+        try:
+            if IS_MAC:
+                nsview = get_nsview(self.video_canvas)
+                if nsview: self.player.set_nsobject(nsview)
+            elif IS_WIN:
+                self.player.set_hwnd(self.video_canvas.winfo_id())
+        except Exception: pass
+
+    def _on_root_unmap(self, event=None):
+        if event and event.widget is not self.root: return
+        if hasattr(self, 'video_window') and self.video_window.winfo_exists(): self.video_window.withdraw()
+
+    def _on_root_map(self, event=None):
+        if event and event.widget is not self.root: return
+        if hasattr(self, 'video_window') and self.video_window.winfo_exists():
+            self.video_window.deiconify()
+            self.root.after(50, self._position_video_window)
+
     def _get_screens(self):
         if not IS_MAC: return None
         try:
             from AppKit import NSScreen
             return [{'x': int(s.frame().origin.x), 'y': int(s.frame().origin.y), 'w': int(s.frame().size.width), 'h': int(s.frame().size.height)} for s in NSScreen.screens()]
+        except ImportError: return None
         except Exception: return None
 
     def _toggle_projector(self):
@@ -648,493 +463,105 @@ class KaraokeApp:
         self.projector_btn.config(text="📺 На проектор", bg="#555")
         self._position_video_window()
 
-    def _create_video_window(self):
-        self.video_window = tk.Toplevel(self.root)
-        self.video_window.configure(bg="black")
-        # Всегда с рамкой — иначе окно перехватывает клики и закрывает крестики
-        self.video_window.title("Karaoke Video")
-        self.video_window.attributes("-topmost", False)
+    def _on_list_select(self, event=None):
+        sel = self.results_list.curselection()
+        if sel and sel[0] < len(self.last_results):
+            self.status_lbl.config(text=self.last_results[sel[0]][0][:110], fg="#00cc66")
 
-        self.video_canvas = tk.Canvas(self.video_window, bg="black",
-                                      highlightthickness=0, bd=0)
-        self.video_canvas.pack(fill=tk.BOTH, expand=True)
+    def _filter_local_files(self, event=None):
+        self._render_local_files()
 
-        self.root.bind("<Configure>", self._on_root_configure)
-        self.root.bind("<FocusIn>", lambda e: self._raise_video())
-        self.root.bind("<Button-1>", lambda e: self._raise_video(), add="+")
-        self.root.bind("<Unmap>", self._on_root_unmap)
-        self.root.bind("<Map>", self._on_root_map)
-        self.root.after(200, self._position_video_window)
-        self.root.after(500, self._attach_vlc)
-        self._keep_video_on_top()
+    def _render_local_files(self):
+        self.results_list.delete(0, tk.END)
+        self.last_results = []
+        query = self.local_search_entry.get().strip().lower() if hasattr(self, 'local_search_entry') else ""
+        count = 0
+        for f, path in getattr(self, 'all_local_files', []):
+            if query and query not in f.lower(): continue
+            self.results_list.insert(tk.END, f"  {f[:36]}{'...' if len(f)>36 else ''}")
+            self.last_results.append((f, path))
+            count += 1
+        self.status_lbl.config(text=f"Локальных: {count}", fg="#888")
 
-    def _on_root_unmap(self, event=None):
-        if event is not None and event.widget is not self.root:
+    def load_local_files(self):
+        self.all_local_files = []
+        if not os.path.exists(self.download_folder):
+            self._render_local_files()
             return
-        try:
-            if hasattr(self, 'video_window') and self.video_window.winfo_exists():
-                self.video_window.attributes("-topmost", False)
-                self.video_window.withdraw()
-        except Exception:
-            pass
+        exts = ('.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv', '.wmv', '.mpg', '.mpeg', '.ts')
+        files = [f for f in os.listdir(self.download_folder) if f.lower().endswith(exts) and not f.startswith('.')]
+        for f in sorted(files, key=lambda x: os.path.getmtime(os.path.join(self.download_folder, x)), reverse=True):
+            self.all_local_files.append((f, os.path.join(self.download_folder, f)))
+        self._render_local_files()
 
-    def _on_root_map(self, event=None):
-        if event is not None and event.widget is not self.root:
-            return
-        try:
-            if hasattr(self, 'video_window') and self.video_window.winfo_exists():
-                self.video_window.deiconify()
-                self.video_window.attributes("-topmost", True)
-                self.root.after(50, self._position_video_window)
-                self.root.after(100, self._raise_video)
-        except Exception:
-            pass
-
-    def _is_maximized(self):
-        """True, если окно развёрнуто (zoomed) или в fullscreen."""
-        try:
-            if self.root.attributes("-fullscreen"):
-                return True
-            if self.root.state() == "zoomed":
-                return True
-        except Exception:
-            pass
-        return False
-
-    def _raise_video(self):
-        try:
-            if not hasattr(self, 'video_window') or not self.video_window.winfo_exists():
-                return
-            if self._is_maximized() or getattr(self, 'projector_mode', False):
-                self.video_window.attributes("-topmost", False)
-                return
-            self.video_window.attributes("-topmost", True)
-            self.video_window.lift()
-        except Exception:
-            pass
-
-    def _keep_video_on_top(self):
-        self._raise_video()
-        try:
-            self.root.after(400, self._keep_video_on_top)
-        except Exception:
-            pass
-
-    def _on_root_configure(self, event=None):
-        if event is not None and event.widget is not self.root:
-            return
-        self.root.after(50, self._position_video_window)
-        # Если сменился maximized — обновить topmost
-        self.root.after(100, self._sync_video_topmost)
-
-    def _sync_video_topmost(self):
-        self._raise_video()
-
-    def _get_screens(self):
-        """Список экранов через AppKit (pyobjc). Возвращает [{x,y,w,h}, ...] или None."""
-        try:
-            from AppKit import NSScreen
-            result = []
-            for s in NSScreen.screens():
-                f = s.frame()
-                result.append({
-                    'x': int(f.origin.x),
-                    'y': int(f.origin.y),
-                    'w': int(f.size.width),
-                    'h': int(f.size.height),
-                })
-            return result
-        except ImportError:
-            return None
-        except Exception:
-            return None
-
-    def _toggle_projector(self):
-        if getattr(self, 'projector_mode', False):
-            self._return_from_projector()
+    def on_mode_change(self):
+        mode = self.mode.get()
+        if mode == "youtube":
+            if hasattr(self, 'local_search_frame'): self.local_search_frame.pack_forget()
+            self.search_frame.pack(fill=tk.X, pady=(0, 5))
+            self.download_btn.grid()
+            if hasattr(self, 'delete_btn'): self.delete_btn.grid_remove()
         else:
-            self._send_to_projector()
+            self.search_frame.pack_forget()
+            if hasattr(self, 'local_search_frame'): self.local_search_frame.pack(fill=tk.X, pady=(0, 5), before=self.results_list)
+            self.download_btn.grid_remove()
+            if hasattr(self, 'delete_btn'): self.delete_btn.grid()
+            self.load_local_files()
 
-    def _send_to_projector(self):
-        screens = self._get_screens()
-        if screens is None:
-            messagebox.showerror(
-                "Нужен pyobjc",
-                "Для работы с проектором установите:\n\n"
-                "sudo port install py312-pyobjc"
-            )
-            return
-        if len(screens) < 2:
-            messagebox.showinfo(
-                "Второй экран не найден",
-                "Подключите проектор или второй монитор и попробуйте снова.\n\n"
-                f"Сейчас подключено экранов: {len(screens)}"
-            )
-            return
-        # Определяем главный экран (обычно origin = 0,0)
-        main_idx = 0
-        for i, s in enumerate(screens):
-            if s['x'] == 0 and s['y'] == 0:
-                main_idx = i
-                break
-        # Второй — любой, кроме главного
-        target = None
-        for i, s in enumerate(screens):
-            if i != main_idx:
-                target = s
-                break
-        if target is None:
-            return
-        try:
-            self.video_window.attributes("-topmost", False)
-            self.video_window.geometry(
-                f"{target['w']}x{target['h']}+{target['x']}+{target['y']}"
-            )
-            self.video_window.lift()
-            self.projector_mode = True
+    def delete_selected_local(self):
+        if self.mode.get() != "local": return
+        sel = self.results_list.curselection()
+        if not sel: return
+        fname, path = self.last_results[sel[0]]
+        if messagebox.askyesno("Удалить", f"Удалить {fname}?"):
             try:
-                self.projector_btn.config(text="📺 Вернуть на главный", bg="#aa4444")
-            except Exception:
-                pass
-            self.status_lbl.config(text="Видео на проекторе", fg="#00cc66")
-        except Exception as e:
-            messagebox.showerror("Ошибка", str(e))
+                os.remove(path)
+                for vid, p in list(self.video_cache.items()):
+                    if p == path: del self.video_cache[vid]
+                self._save_cache()
+                self.load_local_files()
+            except Exception as e: messagebox.showerror("Ошибка", str(e))
 
-    def _return_from_projector(self):
-        self.projector_mode = False
-        try:
-            self.projector_btn.config(text="📺 На проектор", bg="#555")
-        except Exception:
-            pass
-        try:
-            self.video_window.attributes("-topmost", False)
-            self._position_video_window()
-            self.root.after(100, self._raise_video)
-            self.status_lbl.config(text="Видео на главном экране", fg="#888")
-        except Exception as e:
-            messagebox.showerror("Ошибка", str(e))
-
-    def _position_video_window(self):
-        if getattr(self, 'projector_mode', False):
-            return
-        try:
-            if not hasattr(self, 'video_window') or not self.video_window.winfo_exists():
-                return
-            self.root.update_idletasks()
-            x = self.video_placeholder.winfo_rootx()
-            y = self.video_placeholder.winfo_rooty()
-            w = self.video_placeholder.winfo_width()
-            h = self.video_placeholder.winfo_height()
-            # При maximized гарантируем, что видео не перекрывает заголовок macOS
-            if self._is_maximized():
-                y = 30  # высота заголовка macOS + запас
-                screen_h = self.root.winfo_screenheight()
-                h = screen_h - 35  # 30 сверху + 5 снизу
-            if w > 10 and h > 10:
-                self.video_window.geometry(f"{w}x{h}+{x}+{y}")
-                if not self._is_maximized():
-                    self.video_window.lift()
-        except Exception as e:
-            print(f"[video] position error: {e}")
-
-    def _attach_vlc(self):
-        if not IS_MAC:
-            return
-        nsview = get_nsview(self.video_canvas)
-        if nsview:
-            try:
-                self.player.set_nsobject(nsview)
-                print(f"[VLC] NSView привязан: {nsview}")
-            except Exception as e:
-                print(f"[VLC] set_nsobject не удался: {e}")
-        else:
-            print("[VLC] NSView не получен")
-
-    # ---------- Play/Pause (не перезагружает трек) ----------
-    def toggle_play_pause(self):
-        try:
-            if self.player.is_playing():
-                threading.Thread(target=self._do_pause, daemon=True).start()
-            else:
-                sel = self.results_list.curselection()
-                if sel:
-                    self.play_selected()
-                elif self.player.get_media() is not None:
-                    threading.Thread(target=self._do_resume, daemon=True).start()
-        except Exception:
-            pass
-
-    def _do_pause(self):
-        with self._play_lock:
-            try:
-                self.player.pause()
-                self.root.after(0, lambda: self.play_pause_btn.config(text="▶"))
-            except Exception:
-                pass
-
-    def _do_resume(self):
-        with self._play_lock:
-            try:
-                self.player.play()
-                self.root.after(0, lambda: self.play_pause_btn.config(text="⏸"))
-            except Exception:
-                pass
-
-    def update_progress(self):
-        # ВАЖНО: не вызываем progress_var.set() из потока — Tkinter не потокобезопасен!
-        while not self.stop_progress.is_set():
-            try:
-                if self.player.get_length() > 0:
-                    pos = self.player.get_position() * 100
-                    # Планируем обновление в главном потоке Tk
-                    self.root.after(0, lambda p=pos: self._safe_set_progress(p))
-            except Exception:
-                pass
-            time.sleep(0.5)
-
-    def _safe_set_progress(self, pos):
-        try:
-            self.progress_var.set(pos)
-        except Exception:
-            pass
-
-    def on_progress_move(self, val):
-        pass
-
-    def on_progress_release(self, event):
-        try:
-            pos = self.progress_var.get() / 100.0
-            if self.player.get_length() > 0:
-                self.player.set_position(pos)
-        except Exception:
-            pass
-
-    # ---------- Нумерация ----------
     def _get_next_number(self):
         max_num = 0
         if os.path.exists(self.download_folder):
             for f in os.listdir(self.download_folder):
                 m = re.match(r'^(\d+)\s*-\s*', f)
-                if m:
-                    num = int(m.group(1))
-                    if num > max_num:
-                        max_num = num
+                if m: max_num = max(max_num, int(m.group(1)))
         return max_num + 1
 
-    def _numbered_name(self, original_name):
-        return f"{self._get_next_number():02d} - {original_name}"
-
-    # ---------- Режимы ----------
-    def on_mode_change(self):
-        # Сброс предыдущего списка, чтобы не смешивать YouTube ID и локальные пути
-        try:
-            self.results_list.delete(0, tk.END)
-            self.last_results = []
-        except Exception:
-            pass
-        mode = self.mode.get()
-        if mode == "youtube":
-            self.search_frame.pack(fill=tk.X, pady=(0, 5))
-            self.download_btn.grid()
-            self.delete_btn.grid_remove()
-        else:
-            self.search_frame.pack_forget()
-            self.download_btn.grid_remove()
-            self.delete_btn.grid()
-            self.load_local_files()
-
-    def _truncate(self, text, limit=30):
-        if len(text) > limit:
-            return text[:limit] + "..."
-        return text
-
-    def _on_list_select(self, event=None):
-        try:
-            sel = self.results_list.curselection()
-            if not sel:
-                return
-            idx = sel[0]
-            if idx < len(self.last_results):
-                title = self.last_results[idx][0]
-                self.status_lbl.config(text=title[:110], fg="#00cc66")
-        except Exception:
-            pass
-
-    def load_local_files(self):
-        self._clean_cache()
-        self.results_list.delete(0, tk.END)
-        self.last_results = []
-        if not os.path.exists(self.download_folder):
-            return
-        exts = ('.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv', '.wmv', '.mpg', '.mpeg', '.ts')
-        files = [f for f in os.listdir(self.download_folder)
-                 if f.lower().endswith(exts) and not f.startswith('.')]
-        print(f"[local] found {len(files)} file(s) in {self.download_folder}")
-        for _f in sorted(files):
-            print(f"[local]   {_f}")
-        for f in sorted(files,
-                        key=lambda x: os.path.getmtime(os.path.join(self.download_folder, x)),
-                        reverse=True):
-            self.results_list.insert(tk.END, f"  {self._truncate(f)}")
-            self.last_results.append((f, os.path.join(self.download_folder, f)))
-
-    # ---------- Удаление локального файла ----------
-    def delete_selected_local(self):
-        if self.mode.get() != "local":
-            messagebox.showinfo("Только локально", "Удаление доступно только в режиме «Локальные файлы»")
-            return
-        sel = self.results_list.curselection()
-        if not sel:
-            messagebox.showwarning("Не выбрано", "Выберите файл для удаления")
-            return
-        idx = sel[0]
-        if idx >= len(self.last_results):
-            return
-        fname, path = self.last_results[idx]
-        if not messagebox.askyesno("Удалить", f"Удалить файл?\n\n{fname}"):
-            return
-        try:
-            if self.current_original_path == path:
-                self.stop()
-                self.current_original_path = None
-            os.remove(path)
-            for vid, p in list(self.video_cache.items()):
-                if p == path:
-                    del self.video_cache[vid]
-            self._save_cache()
-            self.load_local_files()
-            self.status_lbl.config(text=f"Удалено: {fname}", fg="#888")
-        except Exception as e:
-            messagebox.showerror("Ошибка", str(e))
-
-    # ---------- Резолвер пути ----------
-    def _resolve_downloaded_path(self, ydl, info):
-        if info.get('requested_downloads'):
-            p = info['requested_downloads'][0].get('filepath')
-            if p and os.path.exists(p):
-                return p
-        p = info.get('_filename')
-        if p and os.path.exists(p):
-            return p
-        p = ydl.prepare_filename(info)
-        if p and os.path.exists(p):
-            return p
-        candidates = []
-        if os.path.isdir(self.temp_dir):
-            for f in os.listdir(self.temp_dir):
-                fp = os.path.join(self.temp_dir, f)
-                if os.path.isfile(fp) and f.lower().endswith(('.mp4', '.mkv', '.webm', '.m4a')):
-                    candidates.append(fp)
-        if candidates:
-            return max(candidates, key=os.path.getmtime)
-        return None
-
-    # ---------- Скачивание ----------
     def download_selected(self):
-        if self.mode.get() != "youtube":
-            return
+        if self.mode.get() != "youtube": return
         sel = self.results_list.curselection()
-        if not sel:
-            messagebox.showwarning("Не выбрано", "Выберите видео для сохранения")
+        if not sel: return
+        vid = self.last_results[sel[0]][1]
+        if not re.match(r'^[A-Za-z0-9_-]{11}$', vid): return
+        if self.video_cache.get(vid) and os.path.exists(self.video_cache[vid]):
+            self.status_lbl.config(text="Уже в библиотеке", fg="#00cc66")
             return
-        idx = sel[0]
-        if idx < len(self.last_results):
-            vid = self.last_results[idx][1]
-            if not re.match(r'^[A-Za-z0-9_-]{11}$', vid):
-                messagebox.showerror("Ошибка", "Некорректный трек. Сделайте новый поиск.")
-                return
-            if self.video_cache.get(vid) and os.path.exists(self.video_cache[vid]):
-                self.status_lbl.config(text="Уже в библиотеке", fg="#00cc66")
-                return
-            self.status_lbl.config(text="Скачивание...", fg="#00cc66")
-            threading.Thread(target=self._download, args=(vid, False), daemon=True).start()
-
-
-    def _find_video_id_by_path(self, path):
-        """Ищет video_id для файла, если он есть в кэше."""
-        for vid, p in self.video_cache.items():
-            if p == path:
-                return vid
-        return None
-
-    def _clean_cache(self):
-        """Удаляет мёртвые записи и дубликаты (один файл — один video_id)."""
-        removed = 0
-        paths_seen = {}
-        for vid, p in list(self.video_cache.items()):
-            if not os.path.exists(p):
-                del self.video_cache[vid]
-                removed += 1
-                continue
-            if p in paths_seen:
-                del self.video_cache[vid]
-                removed += 1
-            else:
-                paths_seen[p] = vid
-        if removed:
-            self._save_cache()
-            print(f"[cache] очищено {removed} записей (мёртвые + дубликаты)")
-
-    def _find_by_name(self, basename_without_number):
-        """Ищет файл в папке, у которого отрезан префикс 'NN - '."""
-        if not os.path.isdir(self.download_folder):
-            return None
-        for f in os.listdir(self.download_folder):
-            if f.startswith("."):
-                continue
-            m = re.match(r'^\d+\s*-\s*(.+)$', f)
-            name = m.group(1) if m else f
-            if name == basename_without_number:
-                return os.path.join(self.download_folder, f)
-        return None
-
-    def _check_already_downloaded(self, video_id, ydl_info=None):
-        """
-        Проверяет, есть ли уже этот трек в библиотеке.
-        Только по video_id — без ложных совпадений по имени.
-        """
-        cached = self.video_cache.get(video_id)
-        if cached and os.path.exists(cached):
-            return cached
-        return None
-
-
-    def _is_youtube_id(self, vid):
-        """True, если строка похожа на YouTube video_id (11 символов)."""
-        if not isinstance(vid, str):
-            return False
-        import re as _re
-        return bool(_re.match(r'^[A-Za-z0-9_-]{11}$', vid))
+        self.status_lbl.config(text="Скачивание...", fg="#00cc66")
+        threading.Thread(target=self._download, args=(vid, False), daemon=True).start()
 
     def play_selected(self):
-        mode = self.mode.get()
         sel = self.results_list.curselection()
-        if not sel:
-            messagebox.showwarning("Не выбрано", "Выберите трек")
-            return
-        idx = sel[0]
-        if idx < len(self.last_results):
-            item = self.last_results[idx][1]
-            if mode == "youtube":
-                if not re.match(r'^[A-Za-z0-9_-]{11}$', item):
-                    messagebox.showerror("Ошибка", "Некорректный трек. Сделайте новый поиск.")
-                    return
-                cached = self.video_cache.get(item)
-                if cached and os.path.exists(cached):
-                    self.status_lbl.config(text="Из библиотеки", fg="#00cc66")
-                    self._play_local(cached)
-                    return
-                self.status_lbl.config(text="Загрузка...", fg="#00cc66")
-                threading.Thread(target=self._download, args=(item, True), daemon=True).start()
-            else:
-                self._play_local(item)
-
+        if not sel: return
+        item = self.last_results[sel[0]][1]
+        if self.mode.get() == "youtube":
+            if not re.match(r'^[A-Za-z0-9_-]{11}$', item): return
+            cached = self.video_cache.get(item)
+            if cached and os.path.exists(cached):
+                self.status_lbl.config(text="Из библиотеки", fg="#00cc66")
+                self._play_local(cached)
+                return
+            self.status_lbl.config(text="Загрузка...", fg="#00cc66")
+            threading.Thread(target=self._download, args=(item, True), daemon=True).start()
+        else:
+            self._play_local(item)
 
     def _download(self, video_id, auto_play):
         url = f"https://youtu.be/{video_id}"
         outtmpl = os.path.join(self.temp_dir, '%(title)s.%(ext)s')
         
-        # РАБОЧАЯ КОМАНДА С ЧТЕНИЕМ ИЗ CHROME
         cmd = [
             "/opt/local/bin/python3.12", "-m", "yt_dlp",
             "--cookies-from-browser", "chrome",
@@ -1146,8 +573,7 @@ class KaraokeApp:
             "-o", outtmpl,
             url
         ]
-        if self.proxy_url:
-            cmd.extend(["--proxy", self.proxy_url])
+        if self.proxy_url: cmd.extend(["--proxy", self.proxy_url])
 
         try:
             print("")
@@ -1162,14 +588,12 @@ class KaraokeApp:
                     print("[Ошибка] " + line, flush=True)
             
             process.wait()
-            if process.returncode != 0:
-                raise Exception("yt-dlp завершился с ошибкой")
+            if process.returncode != 0: raise Exception("yt-dlp завершился с ошибкой")
                 
             print("[Скачивание] Файл загружен, ищем на диске...")
 
             downloaded_files = [os.path.join(self.temp_dir, f) for f in os.listdir(self.temp_dir) if f.endswith(('.mp4', '.mkv', '.webm'))]
-            if not downloaded_files:
-                raise Exception("Скачанный файл не найден")
+            if not downloaded_files: raise Exception("Скачанный файл не найден")
             
             temp_path = max(downloaded_files, key=os.path.getmtime)
             new_name = f"{self._get_next_number():02d} - {os.path.basename(temp_path)}"
@@ -1189,281 +613,160 @@ class KaraokeApp:
             print("[Ошибка скачивания] " + str(e))
             self.root.after(0, lambda err=str(e): self.status_lbl.config(text=f"Ошибка: {err}", fg="red"))
 
-
     def _play_local(self, path):
-        if not os.path.exists(path):
-            self.status_lbl.config(
-                text=f"Файл не найден: {os.path.basename(path)}", fg="red")
-            return
-        print(f"[PLAY] {os.path.basename(path)}")
+        if not os.path.exists(path): return
         try:
-            self.placeholder_hint.place_forget()
-        except Exception:
-            pass
-        self.current_original_path = path
-        self.current_pitch = 0
-        try:
+            self.current_original_path = path
+            self.current_pitch = 0
             self.pitch_scale.set(0)
-            self.pitch_val.config(text="0")
-        except Exception:
-            pass
-        # VLC-операции — в фоновом потоке, чтобы не блокировать UI
-        self._play_generation += 1
-        gen = self._play_generation
-        self.play_pause_btn.config(text="⏸")
-        self.status_lbl.config(text="▶ Воспроизведение", fg="#00cc66")
-        threading.Thread(target=self._do_play, args=(path, gen), daemon=True).start()
+            self.player.stop()
+            media = self.instance.media_new_path(path)
+            self.player.set_media(media)
+            self.player.play()
+            self.play_pause_btn.config(text="⏸")
+            
+            # Если окно было скрыто крестиком — показываем его снова
+            if hasattr(self, 'video_window') and self.video_window.winfo_exists():
+                self.video_window.deiconify()
+                self.root.after(50, self._position_video_window)
+            self.status_lbl.config(text="▶ Воспроизведение", fg="#00cc66")
+            self.on_volume_change(self.vol_scale.get())
+        except Exception as e: pass
 
-    def _do_play(self, path, gen):
-        with self._play_lock:
-            if gen != self._play_generation:
-                return  # отменено — запрошено новое воспроизведение
-            try:
-                self.player.stop()
-                media = self.instance.media_new_path(path)
-                self.player.set_media(media)
-                self.player.play()
-            except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda: self.status_lbl.config(
-                    text=f"Ошибка VLC: {err}", fg="red"))
-                return
-        self.root.after(0, lambda: self.on_volume_change(self.vol_scale.get()))
-
-    # ---------- Pitch shift ----------
     def on_pitch_release(self, event):
         semitones = int(self.pitch_scale.get())
-        self.pitch_val.config(text=f"{semitones:+d}" if semitones else "0")
-        if not self.current_original_path:
-            return
-        if semitones == self.current_pitch:
-            return
+        if not self.current_original_path or semitones == self.current_pitch: return
         self.current_pitch = semitones
         threading.Thread(target=self._apply_pitch, args=(semitones,), daemon=True).start()
 
     def _apply_pitch(self, semitones):
         src = self.current_original_path
-        if not src or not os.path.exists(src):
-            self.root.after(0, lambda: self.status_lbl.config(
-                text="Нет загруженного трека", fg="orange"))
-            return
-
-        if semitones == 0:
-            self.root.after(0, lambda: self._play_pitched(src, 0))
-            return
-
+        if not src or not os.path.exists(src): return
+        if semitones == 0: self.root.after(0, lambda: self._play_pitched(src, 0)); return
         key = (src, semitones)
         if key in self.pitch_cache and os.path.exists(self.pitch_cache[key]):
             self.root.after(0, lambda p=self.pitch_cache[key]: self._play_pitched(p, semitones))
             return
-
-        self.root.after(0, lambda: self.status_lbl.config(
-            text=f"Обработка тональности {semitones:+d}...", fg="orange"))
-
+        self.root.after(0, lambda: self.status_lbl.config(text=f"Тональность {semitones:+d}...", fg="orange"))
         ratio = 2 ** (semitones / 12.0)
         sr = 44100
         out_path = os.path.join(self.temp_dir, f"pitched_{semitones:+d}.mp4")
-        asetrate = int(sr * ratio)
-        atempo = 1.0 / ratio
-        cmd = [
-            self.ffmpeg_path, "-y", "-i", src,
-            "-filter_complex",
-            f"[0:a]asetrate={asetrate},aresample={sr},atempo={atempo:.6f}[a]",
-            "-map", "0:v?", "-map", "[a]",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            out_path,
-        ]
+        cmd = [self.ffmpeg_path, "-y", "-i", src, "-filter_complex", f"[0:a]asetrate={int(sr*ratio)},aresample={sr},atempo={1.0/ratio:.6f}[a]", "-map", "0:v?", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", out_path]
         try:
-            result = subprocess.run(cmd, capture_output=True, timeout=180)
-            if result.returncode != 0:
-                err = result.stderr.decode(errors="ignore")[:120]
-                self.root.after(0, lambda: self.status_lbl.config(
-                    text=f"Ошибка pitch: {err}", fg="red"))
-                return
+            subprocess.run(cmd, capture_output=True, timeout=180, check=True)
             self.pitch_cache[key] = out_path
             self.root.after(0, lambda p=out_path: self._play_pitched(p, semitones))
-        except Exception as e:
-            self.root.after(0, lambda: self.status_lbl.config(
-                text=f"Ошибка pitch: {e}", fg="red"))
+        except Exception as e: self.root.after(0, lambda: self.status_lbl.config(text=f"Ошибка pitch: {e}", fg="red"))
 
     def _play_pitched(self, path, semitones):
-        if not os.path.exists(path):
-            return
-        try:
-            pos = self.player.get_position()
-            was_playing = self.player.is_playing()
-            self.player.stop()
-            media = self.instance.media_new_path(path)
-            self.player.set_media(media)
-            self.player.play()
-            if 0 < pos < 1:
-                self.root.after(250, lambda: self.player.set_position(pos))
-            if not was_playing:
-                self.root.after(350, self.player.pause)
-            self.status_lbl.config(
-                text=f"▶ Тональность: {semitones:+d}", fg="#00cc66")
-        except Exception as e:
-            self.status_lbl.config(text=f"Ошибка: {e}", fg="red")
+        if not os.path.exists(path): return
+        pos = self.player.get_position()
+        was_playing = self.player.is_playing()
+        self.player.stop()
+        self.player.set_media(self.instance.media_new_path(path))
+        self.player.play()
+        if 0 < pos < 1: self.root.after(250, lambda: self.player.set_position(pos))
+        if not was_playing: self.root.after(350, self.player.pause)
+        self.status_lbl.config(text=f"▶ Тональность: {semitones:+d}", fg="#00cc66")
 
-    # ---------- Поиск ----------
     def do_search(self):
-        if self.mode.get() != "youtube":
-            return
         q = self.search_entry.get().strip()
-        if not q:
-            messagebox.showwarning("Пусто", "Введите запрос")
-            return
-        if self.search_thread and self.search_thread.is_alive():
-            self.stop_search.set()
-            self.search_thread.join(timeout=0.5)
-        self.stop_search.clear()
+        if not q: return
         self.search_btn.config(state=tk.DISABLED, bg="#555")
         self.stop_btn.config(state=tk.NORMAL, bg="#aa0000")
         self.status_lbl.config(text="Поиск...", fg="#00cc66")
         self.results_list.delete(0, tk.END)
-        self.search_thread = threading.Thread(target=self._search_task,
-                                              args=(q,), daemon=True)
-        self.search_thread.start()
+        threading.Thread(target=self._search_task, args=(q,), daemon=True).start()
 
     def _search_task(self, query):
         try:
-            opts = {
-                'quiet': True,
-                'extract_flat': True,
-                'no_warnings': True,
-                'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
-            }
-            if self.proxy_url: opts['proxy'] = self.proxy_url.replace('socks5h://', 'socks5://')
+            opts = {'quiet': True, 'extract_flat': True, 'no_warnings': True}
             opts['cookiesfrombrowser'] = ('chrome',)
+            opts.setdefault('extractor_args', {})['youtube'] = {'player_client': ['android', 'web']}
+            opts['remote_components'] = ['ejs:github']
+            if self.proxy_url: opts['proxy'] = self.proxy_url.replace('socks5h://', 'socks5://')
+            
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(f"ytsearch15:{query} караоке", download=False)
                 results = [(e.get('title', '')[:45], e['id']) for e in info.get('entries', []) if e.get('id')]
                 self.root.after(0, lambda: self._update_results(results))
-        except Exception as e: self.root.after(0, lambda err=str(e): self.status_lbl.config(text=f"Ошибка: {err}", fg="red"))
-        finally: self.root.after(0, lambda: self.search_btn.config(state=tk.NORMAL, bg="#00cc66"))
+        except Exception as e: 
+            self.root.after(0, lambda: self.status_lbl.config(text=f"Ошибка: {e}", fg="red"))
+        finally: 
+            self.root.after(0, lambda: self.search_btn.config(state=tk.NORMAL, bg="#00cc66"))
 
     def _update_results(self, results):
         self.results_list.delete(0, tk.END)
         self.last_results = results
-        for title, vid in results:
-            self.results_list.insert(tk.END, f"  {self._truncate(title)}")
+        for title, vid in results: self.results_list.insert(tk.END, f"  {title}")
         self.status_lbl.config(text=f"Найдено {len(results)}", fg="#888")
 
-    def _search_finished(self):
+    def stop_search_command(self):
+        self.stop_search.set()
         self.search_btn.config(state=tk.NORMAL, bg="#00cc66")
         self.stop_btn.config(state=tk.DISABLED, bg="#555")
 
-    def stop_search_command(self):
-        if self.search_thread and self.search_thread.is_alive():
-            self.stop_search.set()
-            self.search_btn.config(state=tk.NORMAL, bg="#00cc66")
-            self.stop_btn.config(state=tk.DISABLED, bg="#555")
-            self.status_lbl.config(text="Поиск остановлен", fg="orange")
+    def toggle_play_pause(self):
+        if self.player.is_playing():
+            self.player.pause(); self.play_pause_btn.config(text="▶")
+        else:
+            sel = self.results_list.curselection()
+            if sel: self.play_selected()
+            elif self.player.get_media(): self.player.play(); self.play_pause_btn.config(text="⏸")
 
-    # ---------- Управление ----------
     def stop(self):
-        threading.Thread(target=self._do_stop, daemon=True).start()
-        self.current_url = None
+        self.player.stop(); self.play_pause_btn.config(text="▶")
         self.current_original_path = None
-        self.current_pitch = 0
-        try:
-            self.pitch_scale.set(0)
-            self.pitch_val.config(text="0")
-        except Exception:
-            pass
-        try:
-            self.placeholder_hint.place(relx=0.5, rely=0.62, anchor=tk.CENTER)
-        except Exception:
-            pass
-        try:
-            self.play_pause_btn.config(text="▶")
-        except Exception:
-            pass
-        try:
-            self.status_lbl.config(text="⏹ Остановлено", fg="#888")
-        except Exception:
-            pass
 
-    def _do_stop(self):
-        with self._play_lock:
+    def update_progress(self):
+        while not self.stop_progress.is_set():
             try:
-                self.player.stop()
-            except Exception:
-                pass
+                if self.player.get_length() > 0:
+                    pos = self.player.get_position() * 100
+                    self.root.after(0, lambda p=pos: self.progress_var.set(p))
+            except Exception: pass
+            time.sleep(0.5)
 
-    def on_volume_change(self, val):
-        try:
-            vol = int(float(val))
-            self.player.audio_set_volume(vol)
-            self.vol_val.config(text=f"{vol}%")
-        except Exception:
-            pass
+    def on_progress_move(self, val): pass
+    def on_progress_release(self, event):
+        if self.player.get_length() > 0: self.player.set_position(self.progress_var.get() / 100.0)
+
+    def on_volume_change(self, val): self.player.audio_set_volume(int(float(val)))
 
     def update_zapret_status(self):
-        if self.proxy_url:
-            self.zapret_status.config(text="tpws ON :9876", fg="#00cc66")
-        else:
-            self.zapret_status.config(text="tpws OFF", fg="orange")
+        if IS_WIN: self.zapret_status.config(text="Zapret ON" if self.zapret_process and self.zapret_process.ready else "Zapret OFF")
+        else: self.zapret_status.config(text="tpws ON" if self.proxy_url else "tpws OFF")
 
     def restart_zapret(self):
-        if self._check_tpws():
-            self.status_lbl.config(text="tpws подключён на :9876", fg="#00cc66")
-        else:
-            self.status_lbl.config(
-                text="tpws не запущен — откройте zapret-macos-easy", fg="orange")
+        if IS_WIN and self.zapret_process:
+            self.zapret_process.shutdown(); self.zapret_process.start()
+        elif IS_MAC:
+            if self.tpws_process:
+                self.tpws_process.shutdown()
+                if self.tpws_process.start(): self.proxy_url = TPWS_PROXY
+            else: self._check_tpws()
         self.update_zapret_status()
 
-    def cleanup(self):
-        self.stop_progress.set()
-        self.stop()
+    def _check_for_updates(self):
         try:
-            if hasattr(self, 'tpws_process') and self.tpws_process:
-                self.tpws_process.shutdown()
-        except Exception:
-            pass
-
-        try:
-            if hasattr(self, 'video_window') and self.video_window:
-                self.video_window.destroy()
-        except Exception:
-            pass
-        if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
-            shutil.rmtree(self.temp_dir, ignore_errors=True)
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+            r = requests.get(url, proxies={"https": self.proxy_url} if self.proxy_url else None, timeout=10)
+            if r.status_code == 200:
+                latest = r.json().get("tag_name", "").lstrip("v")
+                if latest and tuple(map(int, latest.split('.'))) > tuple(map(int, APP_VERSION.split('.'))):
+                    self.root.after(0, lambda: self.status_lbl.config(text=f"⬆ Доступна версия {latest}", fg="#ffaa00"))
+        except Exception: pass
 
     def on_closing(self):
-        try:
-            self.stop_progress.set()
-        except Exception:
-            pass
-        try:
-            self.player.stop()
-        except Exception:
-            pass
-        try:
-            self.player.set_media(None)
-        except Exception:
-            pass
-        try:
-            if hasattr(self, 'tpws_process') and self.tpws_process:
-                self.tpws_process.shutdown()
-        except Exception:
-            pass
-        try:
-            if hasattr(self, 'video_window') and self.video_window.winfo_exists():
-                self.video_window.destroy()
-        except Exception:
-            pass
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
-        try:
-            if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
-                shutil.rmtree(self.temp_dir, ignore_errors=True)
-        except Exception:
-            pass
-        os._exit(0)
-
+        self.stop_progress.set()
+        self.stop()
+        if self.zapret_process: self.zapret_process.shutdown()
+        if self.tpws_process: self.tpws_process.shutdown()
+        if hasattr(self, 'node_process') and self.node_process:
+            self.node_process.terminate()
+        try: shutil.rmtree(self.temp_dir, ignore_errors=True)
+        except Exception: pass
+        self.root.destroy()
 
 if __name__ == "__main__":
     root = tk.Tk()
