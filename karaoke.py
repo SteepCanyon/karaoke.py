@@ -77,7 +77,7 @@ except Exception as e:
 
 TPWS_PROXY = "socks5h://127.0.0.1:9876"
 TPWS_PORT = 9876
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 GITHUB_REPO = "SteepCanyon/karaoke.py"
 ZAPRET_DIR = r"C:\Zapret\Dev"
 ZAPRET_EXE_TARGET = os.path.join(ZAPRET_DIR, "Zapret.exe")
@@ -573,26 +573,34 @@ class KaraokeApp:
         url = f"https://youtu.be/{video_id}"
         outtmpl = os.path.join(self.temp_dir, '%(title)s.%(ext)s')
         
-        ydl_opts = {
-            'quiet': True,
-            'format': 'bv*+ba/b',
-            'outtmpl': outtmpl,
-            'nopart': True,
-            'cookiesfrombrowser': ('chrome',),
-            'remote_components': ['ejs:github'],
-            'extractor_args': {'youtube': {'player_client': ['web_creator']}},
-            'source_address': '0.0.0.0', # Принудительный IPv4
-            'progress_hooks': [self._progress_hook]
-        }
-        if self.proxy_url:
-            ydl_opts['proxy'] = self.proxy_url.replace('socks5h://', 'socks5://')
+        # ТОЧНАЯ КОПИЯ РАБОЧЕЙ КОМАНДЫ, НО С АВТО-ПУТЕМ К ПИТОНУ
+        cmd = [
+            sys.executable, "-m", "yt_dlp",
+            "--cookies-from-browser", "chrome",
+            "--remote-components", "ejs:github",
+            "--extractor-args", "youtube:player_client=web_creator",
+            "--force-ipv4",
+            "-f", "bv*+ba/b",
+            "--no-part",
+            "-o", outtmpl,
+            url
+        ]
+        if self.proxy_url: cmd.extend(["--proxy", self.proxy_url])
 
         try:
             print("")
             print("[POT] Запуск скачивания: " + video_id)
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+            for line in process.stdout:
+                line = line.strip()
+                if "[download]" in line and "%" in line:
+                    print("[Скачивание] " + line, flush=True)
+                elif "ERROR" in line:
+                    print("[Ошибка] " + line, flush=True)
+            
+            process.wait()
+            if process.returncode != 0: raise Exception("yt-dlp завершился с ошибкой")
                 
             print("[Скачивание] Файл загружен, ищем на диске...")
 
