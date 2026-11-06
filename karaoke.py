@@ -72,7 +72,7 @@ except Exception as e:
 # ==========================================
 TPWS_PROXY = "socks5h://127.0.0.1:9876"
 TPWS_PORT = 9876
-APP_VERSION = "1.0.14"
+APP_VERSION = "1.0.19"
 GITHUB_REPO = "SteepCanyon/karaoke.py"
 ZAPRET_DIR = r"C:\Zapret\Dev"
 ZAPRET_EXE_TARGET = os.path.join(ZAPRET_DIR, "Zapret.exe")
@@ -143,6 +143,10 @@ class TpwsProcess:
         if self.ready: return True
         if not os.path.exists(self.binary_path): return False
         try:
+            # Выдаем права на запуск (macOS часто снимает их при переносе папок)
+            try: os.chmod(self.binary_path, 0o755)
+            except Exception: pass
+            
             cmd = [self.binary_path, "--socks", "--bind-addr=127.0.0.1", f"--port={self.port}"] + self.strategy
             self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             for _ in range(40):
@@ -286,6 +290,7 @@ class KaraokeApp:
     def _load_config(self):
         defaults = {
             "use_pot": False,
+            "extended_search": True,
             "strategy": ["--split-pos=midsld", "--oob"],
             "format": "bv*+ba/b",
             "download_folder": "~/Music/KaraokePlayer/KaraokeDownloads"
@@ -340,7 +345,23 @@ class KaraokeApp:
         self.notebook.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
 
         self.video_placeholder = tk.Frame(self.notebook, bg="black")
-        self.notebook.add(self.video_placeholder, text="🎤 Видео")
+        self.notebook.add(self.video_placeholder, text="💻 Консоль (Видео)")
+
+        # Консоль внутри вкладки
+        console_frame = tk.Frame(self.video_placeholder, bg="#111")
+        console_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        self.console_text = tk.Text(console_frame, bg="#0a0a0a", fg="#00cc66", font=("Menlo", 11), 
+                                    state=tk.DISABLED, wrap=tk.WORD, highlightthickness=0)
+        self.console_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        scrollbar = tk.Scrollbar(console_frame, command=self.console_text.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.console_text.config(yscrollcommand=scrollbar.set)
+        
+        # Инструкция для видео
+        tk.Label(self.video_placeholder, text="Видео откроется в отдельном окне VLC", 
+                 fg="#555", bg="black", font=("Segoe UI", 10)).pack(side=tk.BOTTOM, pady=5)
 
         self.settings_frame = tk.Frame(self.notebook, bg=bg)
         self.notebook.add(self.settings_frame, text="⚙️ Настройки")
@@ -451,7 +472,10 @@ class KaraokeApp:
             "midsld + oob": ["--split-pos=midsld", "--oob"],
             "disorder + split 1": ["--disorder", "--split-pos=1"],
             "disorder + host + split 1": ["--disorder", "--split-pos=host", "--split-pos=1"],
-            "split 1 + oob": ["--split-pos=1", "--oob"]
+            "split 1 + oob": ["--split-pos=1", "--oob"],
+            "fake + split 1 (Might work)": ["--fake", "--split-pos=1"],
+            "hostspell + disorder": ["--hostspell=host", "--disorder"],
+            "tlsrec + split 2": ["--tlsrec=sni", "--split-pos=2"]
         }
         self.strategy_combo = ttk.Combobox(frame, textvariable=self.strategy_var, values=list(strategies.keys()), state="readonly")
         self.strategy_combo.pack(fill=tk.X, pady=(0, 15))
@@ -488,6 +512,12 @@ class KaraokeApp:
         tk.Checkbutton(frame, text="🔞 Режим обхода 18+ (web_creator)", variable=self.use_pot_var, 
                        bg=bg, fg=fg, selectcolor=entry_bg, activebackground=bg, activeforeground=fg).pack(anchor=tk.W, pady=(0, 15))
 
+        # Расширенный поиск
+        self.extended_search_var = tk.BooleanVar(value=self.config.get("extended_search", True))
+        tk.Checkbutton(frame, text="🔎 Расширенный поиск (караоке + karaoke + минус + instrumental)", 
+                       variable=self.extended_search_var, 
+                       bg=bg, fg=fg, selectcolor=entry_bg, activebackground=bg, activeforeground=fg).pack(anchor=tk.W, pady=(0, 15))
+
         # Папка
         tk.Label(frame, text="Папка для скачивания:", fg=fg, bg=bg, font=("Segoe UI", 10, "bold")).pack(anchor=tk.W, pady=(0, 5))
         folder_frame = tk.Frame(frame, bg=bg)
@@ -520,6 +550,7 @@ class KaraokeApp:
         old_folder = self.download_folder
 
         self.config["use_pot"] = self.use_pot_var.get()
+        self.config["extended_search"] = self.extended_search_var.get()
         self.config["strategy"] = self.strategies_map.get(self.strategy_var.get(), ["--split-pos=midsld", "--oob"])
         self.config["format"] = self.formats_map.get(self.format_var.get(), "bv*+ba/b")
         self.config["download_folder"] = self.folder_var.get()
@@ -635,6 +666,14 @@ class KaraokeApp:
         if sel and sel[0] < len(self.last_results):
             self.status_lbl.config(text=self.last_results[sel[0]][0][:110], fg="#00cc66")
 
+    def log_to_ui(self, message):
+        def _update():
+            self.console_text.config(state=tk.NORMAL)
+            self.console_text.insert(tk.END, str(message) + "\n")
+            self.console_text.see(tk.END)
+            self.console_text.config(state=tk.DISABLED)
+        self.root.after(0, _update)
+
     def _filter_local_files(self, event=None):
         self._render_local_files()
 
@@ -746,7 +785,7 @@ class KaraokeApp:
         }
         
         if use_pot:
-            print("[Скачивание] 🔞 Режим 18+ ВКЛЮЧЕН (web_creator + POT)")
+            self.log_to_ui("🔞 [Скачивание] Режим 18+ ВКЛЮЧЕН (web_creator)")
             ydl_opts.update({
                 'remote_components': ['ejs:github'],
                 'extractor_args': {'youtube': {'player_client': ['web_creator']}},
@@ -758,7 +797,7 @@ class KaraokeApp:
                 'retry_sleep': 2
             })
         else:
-            print("[Скачивание] 🟢 Обычный режим (android/web)")
+            self.log_to_ui("🟢 [Скачивание] Обычный режим (android/web)")
             ydl_opts.update({
                 'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
             })
@@ -767,11 +806,11 @@ class KaraokeApp:
             ydl_opts['proxy'] = self.proxy_url.replace('socks5h://', 'socks5://')
 
         try:
-            print(f"\n[POT] Запуск скачивания: {video_id}")
+            self.log_to_ui(f"📥 [Скачивание] Запуск: {video_id}")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
                 
-            print("[Скачивание] Файл загружен, ищем на диске...")
+            self.log_to_ui("📦 [Скачивание] Файл загружен, ищем на диске...")
             downloaded_files = [os.path.join(self.temp_dir, f) for f in os.listdir(self.temp_dir) if f.endswith(('.mp4', '.mkv', '.webm'))]
             if not downloaded_files: raise Exception("Скачанный файл не найден")
             
@@ -787,16 +826,18 @@ class KaraokeApp:
                 self.root.after(0, lambda: self._play_local(dest))
             else:
                 self.root.after(0, lambda: self.status_lbl.config(text=f"Сохранено: {new_name}", fg="#00cc66"))
+                self.log_to_ui(f"✅ Сохранено: {new_name}")
                 
         except Exception as e:
-            print(f"\n[Ошибка скачивания] {e}")
+            self.log_to_ui(f"❌ ОШИБКА СКАЧИВАНИЯ: {e}")
             self.root.after(0, lambda err=str(e): self.status_lbl.config(text=f"Ошибка: {err}", fg="red"))
+
 
     def _progress_hook(self, d):
         if d['status'] == 'downloading':
-            print(f"\r[Скачивание] {d.get('_percent_str', '0%').strip()} | {d.get('_speed_str', 'N/A').strip()}", end="", flush=True)
+            self.log_to_ui(f"📥 [Скачивание] {d.get('_percent_str', '0%').strip()} | {d.get('_speed_str', 'N/A').strip()}")
         elif d['status'] == 'finished':
-            print("\n[Скачивание] Завершено, склеиваем...")
+            self.log_to_ui("🔗 [Скачивание] Завершено, склеиваем...")
 
     def _play_local(self, path):
         if not os.path.exists(path): return
@@ -864,20 +905,71 @@ class KaraokeApp:
 
     def _search_task(self, query):
         try:
-            opts = {'quiet': True, 'extract_flat': True, 'no_warnings': True}
-            opts['cookiesfrombrowser'] = ('chrome',)
-            opts.setdefault('extractor_args', {})['youtube'] = {'player_client': ['android', 'web']}
-            opts['remote_components'] = ['ejs:github']
-            if self.proxy_url: opts['proxy'] = self.proxy_url.replace('socks5h://', 'socks5://')
+            self.log_to_ui(f"🔍 [Поиск] Начинаю поиск: {query}")
             
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(f"ytsearch15:{query} караоке", download=False)
-                results = [(e.get('title', '')[:45], e['id']) for e in info.get('entries', []) if e.get('id')]
-                self.root.after(0, lambda: self._update_results(results))
+            if self.config.get("extended_search", True):
+                variants = [
+                    f"{query} караоке",
+                    f"{query} karaoke",
+                    f"{query} минус",
+                    f"{query} instrumental",
+                ]
+            else:
+                variants = [f"{query} караоке"]
+            
+            base_opts = {
+                'quiet': True, 
+                'extract_flat': True, 
+                'no_warnings': True,
+                'socket_timeout': 15,
+                'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
+            }
+            if self.proxy_url: 
+                base_opts['proxy'] = self.proxy_url.replace('socks5h://', 'socks5://')
+            
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            
+            seen_ids = set()
+            all_results = []
+            
+            def do_one(q):
+                try:
+                    opts = dict(base_opts)
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(f"ytsearch10:{q}", download=False)
+                        return [(e.get('title', ''), e['id']) for e in info.get('entries', []) if e.get('id')]
+                except Exception as ex:
+                    self.log_to_ui(f"⚠️ Ошибка в '{q}': {ex}")
+                    return []
+            
+            self.log_to_ui(f"📡 Отправляю {len(variants)} запросов параллельно...")
+            
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = {executor.submit(do_one, v): v for v in variants}
+                for fut in as_completed(futures):
+                    q = futures[fut]
+                    try:
+                        results = fut.result()
+                        added = 0
+                        for title, vid in results:
+                            if vid not in seen_ids:
+                                seen_ids.add(vid)
+                                all_results.append((title[:45], vid))
+                                added += 1
+                        self.log_to_ui(f"✅ '{q}': найдено {len(results)}, новых {added}")
+                    except Exception as ex:
+                        self.log_to_ui(f"❌ '{q}' упал: {ex}")
+            
+            self.log_to_ui(f"📊 Всего уникальных треков: {len(all_results)}")
+            self.root.after(0, lambda: self._update_results(all_results))
+                
         except Exception as e: 
-            self.root.after(0, lambda: self.status_lbl.config(text=f"Ошибка: {e}", fg="red"))
+            self.log_to_ui(f"❌ ОШИБКА ПОИСКА: {e}")
+            self.root.after(0, lambda err=str(e): self.status_lbl.config(text=f"Ошибка: {err}", fg="red"))
         finally: 
             self.root.after(0, lambda: self.search_btn.config(state=tk.NORMAL, bg="#00cc66"))
+            self.root.after(0, lambda: self.stop_btn.config(state=tk.DISABLED, bg="#555"))
+
 
     def _update_results(self, results):
         self.results_list.delete(0, tk.END)
