@@ -16,7 +16,6 @@ import tkinter as tk
 from tkinter import messagebox, ttk, filedialog
 import webbrowser
 import requests
-import logging
 
 # ==========================================
 # НАСТРОЙКА ОКРУЖЕНИЯ
@@ -24,27 +23,6 @@ import logging
 IS_MAC = platform.system() == "Darwin"
 IS_WIN = platform.system() == "Windows"
 
-# Логирование
-if IS_WIN:
-    LOG_DIR = r"C:\Users\Suncho\Desktop\karaoke_player_you_tube"
-else:
-    LOG_DIR = os.path.expanduser("~/Desktop/karaoke_player_you_tube")
-
-try:
-    os.makedirs(LOG_DIR, exist_ok=True)
-    LOG_FILE = os.path.join(LOG_DIR, "app.log")
-except Exception:
-    LOG_FILE = "app.log"
-
-logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s', encoding='utf-8')
-
-def handle_exception(exc_type, exc_value, exc_traceback):
-    if issubclass(exc_type, KeyboardInterrupt):
-        sys.__excepthook__(exc_type, exc_value, exc_traceback)
-        return
-    logging.critical("НЕОБРАБОТАННОЕ ИСКЛЮЧЕНИЕ", exc_info=(exc_type, exc_value, exc_traceback))
-
-sys.excepthook = handle_exception
 
 if IS_MAC:
     for _vlc_candidate in ("/Applications/VLC.app/Contents/MacOS", "/Applications/MacPorts/VLC.app/Contents/MacOS"):
@@ -64,7 +42,7 @@ try:
     import vlc
     import yt_dlp
 except Exception as e:
-    logging.critical(f"Ошибка импорта VLC или yt-dlp: {e}")
+    print(f"Ошибка импорта VLC или yt-dlp: {e}")
     sys.exit(1)
 
 # ==========================================
@@ -72,7 +50,7 @@ except Exception as e:
 # ==========================================
 TPWS_PROXY = "socks5h://127.0.0.1:9876"
 TPWS_PORT = 9876
-APP_VERSION = "1.0.19"
+APP_VERSION = "1.0.20"
 GITHUB_REPO = "SteepCanyon/karaoke.py"
 ZAPRET_DIR = r"C:\Zapret\Dev"
 ZAPRET_EXE_TARGET = os.path.join(ZAPRET_DIR, "Zapret.exe")
@@ -253,7 +231,7 @@ class KaraokeApp:
             self.instance = vlc.Instance("--http-user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", "--avcodec-hw=none")
             self.player = self.instance.media_player_new()
         except Exception as e:
-            logging.critical(f"Ошибка VLC: {e}")
+            print(f"Ошибка VLC: {e}")
             sys.exit(1)
 
         # Переменные
