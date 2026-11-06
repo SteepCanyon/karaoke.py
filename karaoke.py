@@ -7,22 +7,24 @@ import socket
 import ctypes
 import json
 import re
-import atexit
 import shutil
 import time
 import tempfile
 import subprocess
 import threading
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk, filedialog
 import webbrowser
 import requests
 import logging
-import traceback
 
+# ==========================================
+# НАСТРОЙКА ОКРУЖЕНИЯ
+# ==========================================
 IS_MAC = platform.system() == "Darwin"
 IS_WIN = platform.system() == "Windows"
 
+# Логирование
 if IS_WIN:
     LOG_DIR = r"C:\Users\Suncho\Desktop\karaoke_player_you_tube"
 else:
@@ -36,15 +38,6 @@ except Exception:
 
 logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s', encoding='utf-8')
 
-class StreamToLogger:
-    def __init__(self, logger, level): self.logger, self.level = logger, level
-    def write(self, buf):
-        for line in buf.rstrip().splitlines(): self.logger.log(self.level, line.rstrip())
-    def flush(self): pass
-
-sys.stdout = StreamToLogger(logging.getLogger("STDOUT"), logging.INFO)
-sys.stderr = StreamToLogger(logging.getLogger("STDERR"), logging.ERROR)
-
 def handle_exception(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
@@ -52,7 +45,6 @@ def handle_exception(exc_type, exc_value, exc_traceback):
     logging.critical("НЕОБРАБОТАННОЕ ИСКЛЮЧЕНИЕ", exc_info=(exc_type, exc_value, exc_traceback))
 
 sys.excepthook = handle_exception
-threading.excepthook = lambda args: logging.critical("ОШИБКА В ПОТОКЕ", exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
 
 if IS_MAC:
     for _vlc_candidate in ("/Applications/VLC.app/Contents/MacOS", "/Applications/MacPorts/VLC.app/Contents/MacOS"):
@@ -72,12 +64,15 @@ try:
     import vlc
     import yt_dlp
 except Exception as e:
-    logging.critical(f"Ошибка импорта: {e}")
+    logging.critical(f"Ошибка импорта VLC или yt-dlp: {e}")
     sys.exit(1)
 
+# ==========================================
+# КОНСТАНТЫ
+# ==========================================
 TPWS_PROXY = "socks5h://127.0.0.1:9876"
 TPWS_PORT = 9876
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.0.14"
 GITHUB_REPO = "SteepCanyon/karaoke.py"
 ZAPRET_DIR = r"C:\Zapret\Dev"
 ZAPRET_EXE_TARGET = os.path.join(ZAPRET_DIR, "Zapret.exe")
@@ -98,6 +93,9 @@ def find_ffmpeg():
         if os.path.exists(p): return p
     return shutil.which("ffmpeg") or "ffmpeg"
 
+# ==========================================
+# WINDOWS ADMIN & ZAPRET
+# ==========================================
 def is_admin():
     try: return ctypes.windll.shell32.IsUserAnAdmin()
     except: return False
@@ -138,13 +136,14 @@ class ZapretProcess:
             self.process.terminate(); self.process = None; self.ready = False
 
 class TpwsProcess:
-    def __init__(self, binary_path, port=TPWS_PORT):
+    def __init__(self, binary_path, port=TPWS_PORT, strategy=None):
         self.binary_path, self.port, self.process, self.ready = binary_path, port, None, False
+        self.strategy = strategy or ["--split-pos=midsld", "--oob"]
     def start(self):
         if self.ready: return True
         if not os.path.exists(self.binary_path): return False
         try:
-            cmd = [self.binary_path, "--socks", "--bind-addr=127.0.0.1", f"--port={self.port}", "--split-pos=midsld", "--oob"]
+            cmd = [self.binary_path, "--socks", "--bind-addr=127.0.0.1", f"--port={self.port}"] + self.strategy
             self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             for _ in range(40):
                 time.sleep(0.1)
@@ -183,36 +182,38 @@ def get_nsview(tk_widget):
         return f(ctypes.c_void_p(tk_widget.winfo_id()))
     except Exception: return None
 
+# ==========================================
+# ГЛАВНЫЙ КЛАСС ПРИЛОЖЕНИЯ
+# ==========================================
 class KaraokeApp:
     def __init__(self, root):
-        # Добавляем пути MacPorts, чтобы yt-dlp нашел deno и ffmpeg
-        os.environ["PATH"] = "/opt/local/bin:/opt/homebrew/bin:" + os.environ.get("PATH", "")
-
         self.root = root
         self.root.title("Караоке-плеер")
         self.root.geometry("1200x750")
         self.root.configure(bg="#0a0a0a")
 
-        # Запуск Node.js сервера
+        # Конфиг
+        self.config_file = os.path.expanduser("~/.karaoke_config.json")
+        self.config = self._load_config()
+
+        # PATH для MacPorts
+        os.environ["PATH"] = "/opt/local/bin:/opt/homebrew/bin:" + os.environ.get("PATH", "")
+
+        # Запуск Node.js POT сервера
         self.node_process = None
         possible_dirs = [
             resource_path("node_server"),
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "bundle_env", "node_server"),
             os.path.expanduser("~/Desktop/bgutil-ytdlp-pot-provider/server")
         ]
-        node_server_dir = None
-        for d in possible_dirs:
-            if os.path.exists(os.path.join(d, "build", "main.js")):
-                node_server_dir = d
-                break
-                
+        node_server_dir = next((d for d in possible_dirs if os.path.exists(os.path.join(d, "build", "main.js"))), None)
+        
         if node_server_dir:
             try:
                 node_bin = "/usr/local/bin/node"
                 bundled_node = os.path.join(node_server_dir, "node")
                 if os.path.exists(bundled_node): 
                     node_bin = bundled_node
-                    # Принудительно выдаем права на запуск, если PyInstaller их сбил
                     try: os.chmod(node_bin, 0o755)
                     except Exception: pass
                 elif not os.path.exists(node_bin): 
@@ -223,6 +224,7 @@ class KaraokeApp:
             except Exception as e:
                 print(f"[POT] ОШИБКА: {e}")
 
+        # Запуск Zapret/Tpws
         self.zapret_process = None
         self.tpws_process = None
         self.proxy_url = None
@@ -238,18 +240,19 @@ class KaraokeApp:
                 messagebox.showerror("VLC не найден", "Установите VLC")
                 sys.exit(1)
             bundled_tpws = resource_path(os.path.join("zapret", "tpws", "tpws"))
-            self.tpws_process = TpwsProcess(bundled_tpws, port=TPWS_PORT)
+            self.tpws_process = TpwsProcess(bundled_tpws, port=TPWS_PORT, strategy=self.config.get("strategy"))
             if self.tpws_process.start(): self.proxy_url = TPWS_PROXY
             else: self._check_tpws()
 
+        # VLC
         try:
-            # Отключаем аппаратное декодирование, чтобы избежать зависаний на Mac
             self.instance = vlc.Instance("--http-user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", "--avcodec-hw=none")
             self.player = self.instance.media_player_new()
         except Exception as e:
             logging.critical(f"Ошибка VLC: {e}")
             sys.exit(1)
 
+        # Переменные
         self.current_url = None
         self.current_original_path = None
         self.current_pitch = 0
@@ -257,8 +260,7 @@ class KaraokeApp:
         self.all_local_files = []
         self.mode = tk.StringVar(value="youtube")
 
-        base = os.path.expanduser("~/Music/KaraokePlayer")
-        self.download_folder = os.path.join(base, "KaraokeDownloads")
+        self.download_folder = os.path.expanduser(self.config.get("download_folder", "~/Music/KaraokePlayer/KaraokeDownloads"))
         os.makedirs(self.download_folder, exist_ok=True)
 
         self.ffmpeg_path = find_ffmpeg()
@@ -274,11 +276,35 @@ class KaraokeApp:
         self.search_thread = None
         self.stop_search = threading.Event()
 
+        # Сборка UI
         self.create_widgets()
         self._create_video_window()
         
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         threading.Thread(target=self._check_for_updates, daemon=True).start()
+
+    def _load_config(self):
+        defaults = {
+            "use_pot": False,
+            "strategy": ["--split-pos=midsld", "--oob"],
+            "format": "bv*+ba/b",
+            "download_folder": "~/Music/KaraokePlayer/KaraokeDownloads"
+        }
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    for k, v in defaults.items():
+                        if k not in data: data[k] = v
+                    return data
+        except Exception: pass
+        return defaults
+
+    def _save_config(self):
+        try:
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, ensure_ascii=False, indent=2)
+        except Exception: pass
 
     def _load_cache(self):
         try:
@@ -301,24 +327,37 @@ class KaraokeApp:
             self.proxy_url = None
             return False
 
+    # ==========================================
+    # ИНТЕРФЕЙС
+    # ==========================================
     def create_widgets(self):
         bg, fg, accent, entry_bg, list_bg = "#0a0a0a", "#e0e0e0", "#00cc66", "#1a1a1a", "#111111"
 
         main = tk.Frame(self.root, bg=bg)
         main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        self.video_placeholder = tk.Frame(main, bg="black")
-        self.video_placeholder.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-        
+        self.notebook = ttk.Notebook(main)
+        self.notebook.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+
+        self.video_placeholder = tk.Frame(self.notebook, bg="black")
+        self.notebook.add(self.video_placeholder, text="🎤 Видео")
+
+        self.settings_frame = tk.Frame(self.notebook, bg=bg)
+        self.notebook.add(self.settings_frame, text="⚙️ Настройки")
+
+        self._build_settings_ui()
+
         right = tk.Frame(main, bg=bg, width=300)
         right.pack(side=tk.RIGHT, fill=tk.Y)
         right.pack_propagate(False)
 
+        # Режимы
         mode_frame = tk.Frame(right, bg=bg)
         mode_frame.pack(fill=tk.X, pady=(0, 5))
         tk.Radiobutton(mode_frame, text="YouTube", variable=self.mode, value="youtube", command=self.on_mode_change, fg=fg, bg=bg, selectcolor=bg).pack(side=tk.LEFT)
-        tk.Radiobutton(mode_frame, text="Локальные файлы", variable=self.mode, value="local", command=self.on_mode_change, fg=fg, bg=bg, selectcolor=bg).pack(side=tk.LEFT, padx=10)
+        tk.Radiobutton(mode_frame, text="Локальные", variable=self.mode, value="local", command=self.on_mode_change, fg=fg, bg=bg, selectcolor=bg).pack(side=tk.LEFT, padx=10)
 
+        # Поиск
         self.search_frame = tk.Frame(right, bg=bg)
         tk.Label(self.search_frame, text="🔍 Поиск", fg=fg, bg=bg, font=("Segoe UI", 10, "bold")).pack(anchor=tk.W)
         self.search_entry = tk.Entry(self.search_frame, bg=entry_bg, fg=fg, insertbackground=fg, relief=tk.FLAT)
@@ -331,12 +370,14 @@ class KaraokeApp:
         self.stop_btn = tk.Button(btn_frame, text="⏹ Стоп", bg="#555", fg=fg, relief=tk.FLAT, command=self.stop_search_command, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT)
 
+        # Локальный поиск
         self.local_search_frame = tk.Frame(right, bg=bg)
         tk.Label(self.local_search_frame, text="🔍 Поиск в локальных", fg=fg, bg=bg, font=("Segoe UI", 10, "bold")).pack(anchor=tk.W)
         self.local_search_entry = tk.Entry(self.local_search_frame, bg=entry_bg, fg=fg, insertbackground=fg, relief=tk.FLAT)
         self.local_search_entry.pack(fill=tk.X, ipady=4, pady=5)
         self.local_search_entry.bind("<KeyRelease>", self._filter_local_files)
 
+        # Статус
         status_frame = tk.Frame(right, bg=bg)
         status_frame.pack(fill=tk.X, pady=5)
         self.status_lbl = tk.Label(status_frame, text="Готов", fg="#888", bg=bg)
@@ -345,12 +386,14 @@ class KaraokeApp:
         self.zapret_status.pack(side=tk.RIGHT)
         self.update_zapret_status()
 
+        # Список
         tk.Label(right, text="🎵 Список", fg=fg, bg=bg, font=("Segoe UI", 10, "bold")).pack(anchor=tk.W, pady=(10, 0))
         self.results_list = tk.Listbox(right, bg=list_bg, fg=fg, relief=tk.FLAT, selectbackground=accent, selectforeground="#000", height=8, width=30)
         self.results_list.pack(fill=tk.BOTH, expand=True, pady=5)
         self.results_list.bind('<Double-1>', lambda e: self.play_selected())
         self.results_list.bind('<<ListboxSelect>>', self._on_list_select)
 
+        # Кнопки управления
         ctrl_frame = tk.Frame(right, bg=bg)
         ctrl_frame.pack(fill=tk.X, pady=5)
         self.download_btn = tk.Button(ctrl_frame, text="📥", bg=accent, fg="#000", font=("Segoe UI", 12, "bold"), relief=tk.FLAT, command=self.download_selected, width=4)
@@ -363,12 +406,14 @@ class KaraokeApp:
         self.delete_btn.grid(row=0, column=3, padx=2)
         self.delete_btn.grid_remove()
 
+        # Прогресс
         progress_frame = tk.Frame(right, bg=bg)
         progress_frame.pack(fill=tk.X, pady=5)
         self.progress_scale = tk.Scale(progress_frame, from_=0, to=100, orient=tk.HORIZONTAL, variable=self.progress_var, command=self.on_progress_move, bg=bg, fg=fg, troughcolor="#333", highlightthickness=0)
         self.progress_scale.pack(fill=tk.X)
         self.progress_scale.bind("<ButtonRelease-1>", self.on_progress_release)
 
+        # Громкость
         vol_frame = tk.Frame(right, bg=bg)
         vol_frame.pack(fill=tk.X, pady=5)
         tk.Label(vol_frame, text="🔊 Громкость", fg=fg, bg=bg).pack(anchor=tk.W)
@@ -376,6 +421,7 @@ class KaraokeApp:
         self.vol_scale.set(100)
         self.vol_scale.pack(fill=tk.X)
 
+        # Тональность
         pitch_frame = tk.Frame(right, bg=bg)
         pitch_frame.pack(fill=tk.X, pady=5)
         tk.Label(pitch_frame, text="🎚 Тональность", fg=fg, bg=bg).pack(anchor=tk.W)
@@ -383,6 +429,7 @@ class KaraokeApp:
         self.pitch_scale.pack(fill=tk.X)
         self.pitch_scale.bind("<ButtonRelease-1>", self.on_pitch_release)
 
+        # Нижние кнопки
         self.restart_zapret_btn = tk.Button(right, text="🔄 Проверить обход", bg=accent, fg="#000", relief=tk.FLAT, command=self.restart_zapret)
         self.restart_zapret_btn.pack(fill=tk.X, pady=(5, 2))
         
@@ -391,7 +438,114 @@ class KaraokeApp:
 
         self.on_mode_change()
 
-    # --- ВИДЕО ОКНО ---
+    def _build_settings_ui(self):
+        bg, fg = "#0a0a0a", "#e0e0e0"
+        entry_bg = "#1a1a1a"
+        frame = tk.Frame(self.settings_frame, bg=bg, padx=20, pady=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # Стратегия
+        tk.Label(frame, text="Стратегия обхода (tpws):", fg=fg, bg=bg, font=("Segoe UI", 10, "bold")).pack(anchor=tk.W, pady=(0, 5))
+        self.strategy_var = tk.StringVar()
+        strategies = {
+            "midsld + oob": ["--split-pos=midsld", "--oob"],
+            "disorder + split 1": ["--disorder", "--split-pos=1"],
+            "disorder + host + split 1": ["--disorder", "--split-pos=host", "--split-pos=1"],
+            "split 1 + oob": ["--split-pos=1", "--oob"]
+        }
+        self.strategy_combo = ttk.Combobox(frame, textvariable=self.strategy_var, values=list(strategies.keys()), state="readonly")
+        self.strategy_combo.pack(fill=tk.X, pady=(0, 15))
+        
+        curr_strategy = self.config.get("strategy", ["--split-pos=midsld", "--oob"])
+        for k, v in strategies.items():
+            if v == curr_strategy:
+                self.strategy_var.set(k)
+                break
+        self.strategies_map = strategies
+
+        # Формат
+        tk.Label(frame, text="Качество видео:", fg=fg, bg=bg, font=("Segoe UI", 10, "bold")).pack(anchor=tk.W, pady=(0, 5))
+        self.format_var = tk.StringVar()
+        formats = {
+            "Лучшее (bv*+ba/b)": "bv*+ba/b",
+            "1080p (bv*[height<=1080]+ba/b)": "bv*[height<=1080]+ba/b",
+            "720p (bv*[height<=720]+ba/b)": "bv*[height<=720]+ba/b",
+            "480p (bv*[height<=480]+ba/b)": "bv*[height<=480]+ba/b",
+            "360p (mp4)": "18"
+        }
+        self.format_combo = ttk.Combobox(frame, textvariable=self.format_var, values=list(formats.keys()), state="readonly")
+        self.format_combo.pack(fill=tk.X, pady=(0, 15))
+        
+        curr_format = self.config.get("format", "bv*+ba/b")
+        for k, v in formats.items():
+            if v == curr_format:
+                self.format_var.set(k)
+                break
+        self.formats_map = formats
+
+        # 18+
+        self.use_pot_var = tk.BooleanVar(value=self.config.get("use_pot", False))
+        tk.Checkbutton(frame, text="🔞 Режим обхода 18+ (web_creator)", variable=self.use_pot_var, 
+                       bg=bg, fg=fg, selectcolor=entry_bg, activebackground=bg, activeforeground=fg).pack(anchor=tk.W, pady=(0, 15))
+
+        # Папка
+        tk.Label(frame, text="Папка для скачивания:", fg=fg, bg=bg, font=("Segoe UI", 10, "bold")).pack(anchor=tk.W, pady=(0, 5))
+        folder_frame = tk.Frame(frame, bg=bg)
+        folder_frame.pack(fill=tk.X, pady=(0, 15))
+        
+        self.folder_var = tk.StringVar(value=self.download_folder)
+        self.folder_entry = tk.Entry(folder_frame, textvariable=self.folder_var, bg=entry_bg, fg=fg, insertbackground=fg, relief=tk.FLAT)
+        self.folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+        
+        tk.Button(folder_frame, text="...", bg="#555", fg=fg, command=self._browse_folder, width=3).pack(side=tk.RIGHT, padx=(5, 0))
+
+        # Сохранить
+        tk.Button(frame, text="💾 Сохранить настройки", bg="#00cc66", fg="#000", font=("Segoe UI", 10, "bold"), relief=tk.FLAT, command=self._save_settings).pack(fill=tk.X, pady=(10, 20))
+
+        # Инфа
+        tk.Label(frame, text="Автор: SteepCanyon", fg="#888", bg=bg).pack(anchor=tk.W)
+        tk.Label(frame, text=f"Версия: {APP_VERSION}", fg="#888", bg=bg).pack(anchor=tk.W)
+        tk.Button(frame, text="🌐 GitHub", bg="#333", fg=fg, relief=tk.FLAT, command=lambda: webbrowser.open(f"https://github.com/{GITHUB_REPO}")).pack(anchor=tk.W, pady=(5, 0))
+
+    # ==========================================
+    # МЕТОДЫ НАСТРОЕК
+    # ==========================================
+    def _browse_folder(self):
+        folder = filedialog.askdirectory(initialdir=self.folder_var.get())
+        if folder:
+            self.folder_var.set(folder)
+
+    def _save_settings(self):
+        old_strategy = self.config.get("strategy")
+        old_folder = self.download_folder
+
+        self.config["use_pot"] = self.use_pot_var.get()
+        self.config["strategy"] = self.strategies_map.get(self.strategy_var.get(), ["--split-pos=midsld", "--oob"])
+        self.config["format"] = self.formats_map.get(self.format_var.get(), "bv*+ba/b")
+        self.config["download_folder"] = self.folder_var.get()
+
+        self._save_config()
+
+        if self.config["download_folder"] != old_folder:
+            self.download_folder = os.path.expanduser(self.config["download_folder"])
+            os.makedirs(self.download_folder, exist_ok=True)
+            self.cache_file = os.path.join(self.download_folder, ".cache.json")
+            self.video_cache = self._load_cache()
+            self.load_local_files()
+
+        if IS_MAC and self.config["strategy"] != old_strategy:
+            bundled_tpws = resource_path(os.path.join("zapret", "tpws", "tpws"))
+            self.tpws_process.shutdown()
+            self.tpws_process = TpwsProcess(bundled_tpws, port=TPWS_PORT, strategy=self.config["strategy"])
+            if self.tpws_process.start(): self.proxy_url = TPWS_PROXY
+            else: self.proxy_url = None
+            self.update_zapret_status()
+
+        messagebox.showinfo("Настройки", "Настройки сохранены!")
+
+    # ==========================================
+    # ВИДЕО ОКНО
+    # ==========================================
     def _create_video_window(self):
         self.video_window = tk.Toplevel(self.root)
         self.video_window.title("Karaoke Video")
@@ -401,10 +555,9 @@ class KaraokeApp:
         self.video_canvas = tk.Canvas(self.video_window, bg="black", highlightthickness=0, bd=0)
         self.video_canvas.pack(fill=tk.BOTH, expand=True)
         
-        # Перехватываем крестик: скрываем окно, а не убиваем его
         self.video_window.protocol("WM_DELETE_WINDOW", self.video_window.withdraw)
 
-        self.root.bind("<Configure>", lambda e: self.root.after(50, self._position_video_window) if e.widget is self.root else None)
+        self.video_placeholder.bind("<Configure>", lambda e: self.root.after(50, self._position_video_window))
         self.root.bind("<Unmap>", self._on_root_unmap)
         self.root.bind("<Map>", self._on_root_map)
         self.root.after(200, self._position_video_window)
@@ -440,6 +593,9 @@ class KaraokeApp:
             self.video_window.deiconify()
             self.root.after(50, self._position_video_window)
 
+    # ==========================================
+    # ПРОЕКТОР
+    # ==========================================
     def _get_screens(self):
         if not IS_MAC: return None
         try:
@@ -471,6 +627,9 @@ class KaraokeApp:
         self.projector_btn.config(text="📺 На проектор", bg="#555")
         self._position_video_window()
 
+    # ==========================================
+    # ЛОГИКА РАБОТЫ
+    # ==========================================
     def _on_list_select(self, event=None):
         sel = self.results_list.curselection()
         if sel and sel[0] < len(self.last_results):
@@ -566,41 +725,53 @@ class KaraokeApp:
         else:
             self._play_local(item)
 
-    def _progress_hook(self, d):
-        if d['status'] == 'downloading':
-            print(f"\r[Скачивание] {d.get('_percent_str', '0%').strip()} | {d.get('_speed_str', 'N/A').strip()}", end="", flush=True)
-        elif d['status'] == 'finished':
-            print("\n[Скачивание] Завершено, склеиваем...")
-
     def _download(self, video_id, auto_play):
         url = f"https://youtu.be/{video_id}"
         outtmpl = os.path.join(self.temp_dir, '%(title)s.%(ext)s')
         
+        for f in os.listdir(self.temp_dir):
+            try: os.remove(os.path.join(self.temp_dir, f))
+            except Exception: pass
+
+        fmt = self.config.get("format", "bv*+ba/b")
+        use_pot = self.config.get("use_pot", False)
+        
         ydl_opts = {
             'quiet': True,
-            'format': 'bv*+ba/b',
+            'format': fmt,
             'outtmpl': outtmpl,
             'nopart': True,
             'cookiesfrombrowser': ('chrome',),
-            'remote_components': ['ejs:github'],
-            'extractor_args': {'youtube': {'player_client': ['web_creator']}},
-            'source_address': '0.0.0.0', # Принудительный IPv4
             'progress_hooks': [self._progress_hook]
         }
         
-            
+        if use_pot:
+            print("[Скачивание] 🔞 Режим 18+ ВКЛЮЧЕН (web_creator + POT)")
+            ydl_opts.update({
+                'remote_components': ['ejs:github'],
+                'extractor_args': {'youtube': {'player_client': ['web_creator']}},
+                'source_address': '0.0.0.0',
+                'http_chunk_size': 10485760,
+                'socket_timeout': 60,
+                'retries': 20,
+                'fragment_retries': 20,
+                'retry_sleep': 2
+            })
+        else:
+            print("[Скачивание] 🟢 Обычный режим (android/web)")
+            ydl_opts.update({
+                'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
+            })
+
         if self.proxy_url:
             ydl_opts['proxy'] = self.proxy_url.replace('socks5h://', 'socks5://')
 
         try:
-            print("")
-            print("[POT] Запуск скачивания: " + video_id)
-            
+            print(f"\n[POT] Запуск скачивания: {video_id}")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
                 
             print("[Скачивание] Файл загружен, ищем на диске...")
-
             downloaded_files = [os.path.join(self.temp_dir, f) for f in os.listdir(self.temp_dir) if f.endswith(('.mp4', '.mkv', '.webm'))]
             if not downloaded_files: raise Exception("Скачанный файл не найден")
             
@@ -618,10 +789,14 @@ class KaraokeApp:
                 self.root.after(0, lambda: self.status_lbl.config(text=f"Сохранено: {new_name}", fg="#00cc66"))
                 
         except Exception as e:
-            print("")
-            print("[Ошибка скачивания] " + str(e))
+            print(f"\n[Ошибка скачивания] {e}")
             self.root.after(0, lambda err=str(e): self.status_lbl.config(text=f"Ошибка: {err}", fg="red"))
 
+    def _progress_hook(self, d):
+        if d['status'] == 'downloading':
+            print(f"\r[Скачивание] {d.get('_percent_str', '0%').strip()} | {d.get('_speed_str', 'N/A').strip()}", end="", flush=True)
+        elif d['status'] == 'finished':
+            print("\n[Скачивание] Завершено, склеиваем...")
 
     def _play_local(self, path):
         if not os.path.exists(path): return
@@ -635,13 +810,12 @@ class KaraokeApp:
             self.player.play()
             self.play_pause_btn.config(text="⏸")
             
-            # Если окно было скрыто крестиком — показываем его снова
             if hasattr(self, 'video_window') and self.video_window.winfo_exists():
                 self.video_window.deiconify()
                 self.root.after(50, self._position_video_window)
             self.status_lbl.config(text="▶ Воспроизведение", fg="#00cc66")
             self.on_volume_change(self.vol_scale.get())
-        except Exception as e: pass
+        except Exception: pass
 
     def on_pitch_release(self, event):
         semitones = int(self.pitch_scale.get())
