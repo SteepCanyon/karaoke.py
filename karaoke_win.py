@@ -98,6 +98,13 @@ if IS_WIN:
         except Exception:
             pass
 
+def resource_path(relative_path):
+    """Путь к ресурсу: рядом со скриптом или внутри собранного .exe."""
+    if getattr(sys, 'frozen', False):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
+
+
 # ============================================================
 # ОКРУЖЕНИЕ VLC
 # ============================================================
@@ -119,6 +126,7 @@ if IS_MAC:
 
 if IS_WIN:
     for _vlc_win in (
+        resource_path("vlc_bundle"),
         r"C:\Program Files\VideoLAN\VLC",
         r"C:\Program Files (x86)\VideoLAN\VLC",
     ):
@@ -159,12 +167,6 @@ ZAPRET_EXE_TARGET = os.path.join(ZAPRET_DIR, "Zapret.exe")
 
 # Скрываем консольные окна дочерних процессов на Windows.
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
-
-
-def resource_path(relative_path):
-    if getattr(sys, 'frozen', False):
-        return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
 
 
 def find_ffmpeg():
@@ -438,11 +440,16 @@ class KaraokeApp:
         # ---------- обход блокировок ----------
         if IS_WIN:
             if not os.path.exists(ZAPRET_EXE_TARGET):
-                if not install_zapret():
-                    messagebox.showerror("Ошибка", "Не удалось установить Zapret.\nПроверьте папку 'zapret' рядом с программой.")
-                    sys.exit(1)
-            self.zapret_process = ZapretProcess(ZAPRET_EXE_TARGET)
-            self.zapret_process.start()
+                install_zapret()
+            if os.path.exists(ZAPRET_EXE_TARGET):
+                self.zapret_process = ZapretProcess(ZAPRET_EXE_TARGET)
+                self.zapret_process.start()
+            else:
+                # Без Zapret программа работает, но поиск/скачивание YouTube могут блокироваться
+                logging.warning("Zapret не найден — обход блокировок отключён")
+                self.root.after(300, lambda: self.status_lbl.config(
+                    text="Zapret не найден — обход выключен", fg="#ffaa00"
+                ))
         else:
             if not os.path.exists("/Applications/VLC.app") and not os.path.exists("/Applications/MacPorts/VLC.app"):
                 messagebox.showerror("VLC не найден", "Установите VLC")

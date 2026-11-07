@@ -1,30 +1,64 @@
 name: Build Windows
+
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller python-vlc yt-dlp requests packaging PySocks
-      - name: Build .exe
+          pip install pyinstaller python-vlc yt-dlp requests PySocks
+
+      - name: Fetch ffmpeg (static build)
+        shell: pwsh
         run: |
-          pyinstaller --windowed --name "KaraokePlayer" ^
-            --add-data "zapret\tpws\tpws.exe;zapret\tpws" ^
-            --add-data "ffmpeg\ffmpeg.exe;ffmpeg" ^
-            --hidden-import vlc ^
-            --hidden-import yt_dlp ^
-            --hidden-import socks ^
-            --hidden-import sockshandler ^
-            karaoke.py
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp -Force
+          $exe = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          if (-not $exe) { throw "ffmpeg.exe not found in archive" }
+          New-Item -ItemType Directory -Force -Path ffmpeg | Out-Null
+          Copy-Item $exe.FullName "ffmpeg\ffmpeg.exe"
+
+      - name: Fetch VLC (portable)
+        shell: pwsh
+        run: |
+          $index = Invoke-WebRequest -Uri "https://get.videolan.org/vlc/last/win64/" -UseBasicParsing
+          $zip = $index.Links | Where-Object { $_.href -match '^vlc-.*-win64\.zip$' } | Select-Object -First 1
+          if (-not $zip) { throw "VLC win64 zip not found on get.videolan.org" }
+          Invoke-WebRequest -Uri ("https://get.videolan.org/vlc/last/win64/" + $zip.href) -OutFile vlc.zip
+          Expand-Archive vlc.zip -DestinationPath vlc_tmp -Force
+          $root = Get-ChildItem vlc_tmp -Directory | Select-Object -First 1
+          Copy-Item -Recurse $root.FullName vlc_bundle
+
+      - name: Build .exe
+        shell: pwsh
+        run: |
+          $args = @(
+            "--noconfirm", "--windowed", "--onedir",
+            "--name", "KaraokePlayer",
+            "--icon", "AppIcon.ico",
+            "--add-data", "ffmpeg;ffmpeg",
+            "--add-data", "vlc_bundle;vlc_bundle",
+            "--hidden-import", "vlc",
+            "--hidden-import", "yt_dlp",
+            "--collect-all", "yt_dlp"
+          )
+          if (Test-Path "zapret\Zapret.exe") { $args += @("--add-data", "zapret;zapret") }
+          if (Test-Path "node_server\build\main.js") { $args += @("--add-data", "node_server;node_server") }
+          $args += "karaoke_win.py"
+          pyinstaller @args
+
       - name: Build installer (Inno Setup)
         shell: pwsh
         run: |
@@ -35,16 +69,34 @@ jobs:
           AppVersion=${{ github.ref_name }}
           DefaultDirName={autopf}\KaraokePlayer
           DefaultGroupName=KaraokePlayer
+          OutputDir=Output
           OutputBaseFilename=KaraokePlayer-Setup-${{ github.ref_name }}
           Compression=lzma
           SolidCompression=yes
+          SetupIconFile=AppIcon.ico
           [Files]
-          Source: "dist\KaraokePlayer\*"; DestDir: "{app}"; Flags: recursesubdirs
+          Source: "dist\KaraokePlayer\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
           [Icons]
           Name: "{group}\KaraokePlayer"; Filename: "{app}\KaraokePlayer.exe"
           "@ | Out-File -Encoding ASCII installer.iss
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+
+      - name: Portable zip
+        shell: pwsh
+        run: Compress-Archive -Path dist\KaraokePlayer -DestinationPath KaraokePlayer-Windows.zip -Force
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: KaraokePlayer-Windows
+          path: |
+            Output\KaraokePlayer-Setup-*.exe
+            KaraokePlayer-Windows.zip
+
       - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: Output\KaraokePlayer-Setup-*.exe
+          files: |
+            Output/KaraokePlayer-Setup-*.exe
+            KaraokePlayer-Windows.zip
