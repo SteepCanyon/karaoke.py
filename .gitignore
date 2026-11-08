@@ -14,3 +14,9 @@ KaraokeDownloads/
 __pycache__/
 bundle_env/
 karaoke_backup_before_features.py
+karaoke - ?.py
+karaoke_*.py
+karaoke*копия*.py
+bgutil-plugin.zip
+logo.png
+*.txt
