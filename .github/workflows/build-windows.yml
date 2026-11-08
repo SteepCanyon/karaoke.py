@@ -31,15 +31,13 @@ jobs:
           Copy-Item $exe.FullName "ffmpeg\ffmpeg.exe"
 
       - name: Fetch VLC (portable)
-        shell: pwsh
         run: |
-          $index = Invoke-WebRequest -Uri "https://get.videolan.org/vlc/last/win64/" -UseBasicParsing
-          $zip = $index.Links | Where-Object { $_.href -match '^vlc-.*-win64\.zip$' } | Select-Object -First 1
-          if (-not $zip) { throw "VLC win64 zip not found on get.videolan.org" }
-          Invoke-WebRequest -Uri ("https://get.videolan.org/vlc/last/win64/" + $zip.href) -OutFile vlc.zip
-          Expand-Archive vlc.zip -DestinationPath vlc_tmp -Force
-          $root = Get-ChildItem vlc_tmp -Directory | Select-Object -First 1
-          Copy-Item -Recurse $root.FullName vlc_bundle
+          $url = "https://get.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.zip"
+          Invoke-WebRequest -Uri $url -OutFile "vlc.zip"
+          Expand-Archive -Path "vlc.zip" -DestinationPath "vlc_tmp"
+          Move-Item -Path "vlc_tmplc-3.0.21" -Destination "vlc"
+          Remove-Item -Path "vlc.zip"
+          Remove-Item -Path "vlc_tmp" -Recurse
 
       - name: Build .exe
         shell: pwsh
