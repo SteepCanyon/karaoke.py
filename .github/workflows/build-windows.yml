@@ -46,12 +46,10 @@ jobs:
           Copy-Item $exe.FullName "ffmpeg\ffmpeg.exe"
 
       - name: Fetch VLC
-        shell: pwsh
         run: |
-          $url = "https://get.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.zip"
-          Invoke-WebRequest -Uri $url -OutFile "vlc.zip"
-          Expand-Archive -Path "vlc.zip" -DestinationPath "vlc_tmp" -Force
-          Move-Item -Path "vlc_tmp\vlc-3.0.21" -Destination "vlc"
+          curl.exe -L -o vlc.zip "https://get.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.zip"
+          Expand-Archive -Path "vlc.zip" -DestinationPath "vlc_tmp"
+          Move-Item -Path "vlc_tmplc-3.0.21" -Destination "vlc"
           Remove-Item -Path "vlc.zip"
           Remove-Item -Path "vlc_tmp" -Recurse
 
