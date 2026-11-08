@@ -16,19 +16,22 @@ jobs:
           
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller python-vlc yt-dlp requests packaging PySocks
 
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Build POT Server
         run: |
           git clone https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git
           cd bgutil-ytdlp-pot-provider/server
           npm ci --include=dev
-          .\node_modules\.bin\tsc
+          npx tsc
           cd ../..
           mkdir node_server
           xcopy /E /I bgutil-ytdlp-pot-provider\server\build node_server\build
