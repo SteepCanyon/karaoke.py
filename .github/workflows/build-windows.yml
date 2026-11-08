@@ -1,5 +1,4 @@
 name: Build Windows
-
 on:
   push:
     tags: ['v*']
@@ -14,13 +13,29 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller python-vlc yt-dlp requests PySocks
+          pip install pyinstaller python-vlc yt-dlp requests packaging PySocks
 
-      - name: Fetch ffmpeg (static build)
+      - name: Build POT Server
+        run: |
+          git clone https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git
+          cd bgutil-ytdlp-pot-provider/server
+          npm ci --include=dev
+          .\node_modules\.bin\tsc
+          cd ../..
+          mkdir node_server
+          xcopy /E /I bgutil-ytdlp-pot-provider\server\build node_server\build
+          xcopy /E /I bgutil-ytdlp-pot-provider\server\node_modules node_server\node_modules
+          copy bgutil-ytdlp-pot-provider\server\package.json node_server\
+
+      - name: Fetch ffmpeg
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
@@ -30,12 +45,13 @@ jobs:
           New-Item -ItemType Directory -Force -Path ffmpeg | Out-Null
           Copy-Item $exe.FullName "ffmpeg\ffmpeg.exe"
 
-      - name: Fetch VLC (portable)
+      - name: Fetch VLC
+        shell: pwsh
         run: |
           $url = "https://get.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.zip"
           Invoke-WebRequest -Uri $url -OutFile "vlc.zip"
-          Expand-Archive -Path "vlc.zip" -DestinationPath "vlc_tmp"
-          Move-Item -Path "vlc_tmplc-3.0.21" -Destination "vlc"
+          Expand-Archive -Path "vlc.zip" -DestinationPath "vlc_tmp" -Force
+          Move-Item -Path "vlc_tmp\vlc-3.0.21" -Destination "vlc"
           Remove-Item -Path "vlc.zip"
           Remove-Item -Path "vlc_tmp" -Recurse
 
@@ -47,14 +63,14 @@ jobs:
             "--name", "KaraokePlayer",
             "--icon", "AppIcon.ico",
             "--add-data", "ffmpeg;ffmpeg",
-            "--add-data", "vlc_bundle;vlc_bundle",
+            "--add-data", "vlc;vlc",
             "--hidden-import", "vlc",
             "--hidden-import", "yt_dlp",
             "--collect-all", "yt_dlp"
           )
           if (Test-Path "zapret\Zapret.exe") { $args += @("--add-data", "zapret;zapret") }
           if (Test-Path "node_server\build\main.js") { $args += @("--add-data", "node_server;node_server") }
-          $args += "karaoke_win.py"
+          $args += "karaoke.py"
           pyinstaller @args
 
       - name: Build installer (Inno Setup)
@@ -79,7 +95,7 @@ jobs:
           "@ | Out-File -Encoding ASCII installer.iss
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
 
-      - name: Portable zip
+      - name: Portable ZIP
         shell: pwsh
         run: Compress-Archive -Path dist\KaraokePlayer -DestinationPath KaraokePlayer-Windows.zip -Force
 
