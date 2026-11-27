@@ -36,7 +36,7 @@ except Exception as e:
 
 TPWS_PROXY = "socks5h://127.0.0.1:9876"
 TPWS_PORT = 9876
-APP_VERSION = "1.0.30"
+APP_VERSION = "1.0.31"
 GITHUB_REPO = "SteepCanyon/karaoke.py"
 
 def resource_path(relative_path):
@@ -701,6 +701,7 @@ class KaraokeApp:
         
         ydl_opts = {
             'quiet': True,
+            'outtmpl': outtmpl,
             'nopart': True,
             'progress_hooks': [self._progress_hook],
             'socket_timeout': 30,                   # Таймаут 30 сек
