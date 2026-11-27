@@ -63,14 +63,18 @@ def build():
             "--add-binary", "bundle_env/node_server/node:node_server"
         ]
     
+    ffmpeg_bin = PROJECT_DIR / "ffmpeg" / "ffmpeg"
+    if ffmpeg_bin.exists():
+        add_data_args += ["--add-binary", f"{ffmpeg_bin}:ffmpeg"]
+
     cmd = [
         PYTHON, "-m", "PyInstaller",
         "--windowed", "--name", "KaraokePlayer",
         "--osx-bundle-identifier", "com.suncho.karaokeplayer",
         "--add-data", "zapret/tpws/tpws:zapret/tpws",
+        "--collect-all", "yt_dlp",
     ] + add_data_args + [
         "--hidden-import", "vlc",
-        "--hidden-import", "yt_dlp",
     ]
     
     if (PROJECT_DIR / "AppIcon.icns").exists(): cmd += ["--icon", "AppIcon.icns"]

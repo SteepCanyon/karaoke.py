@@ -21,3 +21,4 @@ bgutil-plugin.zip
 logo.png
 *.txt
 karaoke - *.py
+karaoke [0-9]*.py

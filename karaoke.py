@@ -36,7 +36,7 @@ except Exception as e:
 
 TPWS_PROXY = "socks5h://127.0.0.1:9876"
 TPWS_PORT = 9876
-APP_VERSION = "1.0.29"
+APP_VERSION = "1.0.30"
 GITHUB_REPO = "SteepCanyon/karaoke.py"
 
 def resource_path(relative_path):
@@ -701,10 +701,14 @@ class KaraokeApp:
         
         ydl_opts = {
             'quiet': True,
-            'format': fmt,
-            'outtmpl': outtmpl,
             'nopart': True,
             'progress_hooks': [self._progress_hook],
+            'socket_timeout': 30,                   # Таймаут 30 сек
+            'retries': 10,                          # 10 попыток при обрыве
+            'fragment_retries': 20,
+            'http_chunk_size': 2097152,            # Качаем кусками по 2 МБ (лечит обрывы)
+            'check_formats': 'selected',           # не брать форматы без прямого URL
+            'concurrent_fragment_downloads': 4,    # HLS: 4 куска параллельно
         }
         
         if use_cookies:
@@ -713,6 +717,7 @@ class KaraokeApp:
                 ydl_opts.update(cookie_opt)
                 self.log_to_ui(f"🍪 Куки: {list(cookie_opt.keys())[0]}")
         
+        # Настраиваем клиентов в зависимости от режима
         if use_pot:
             self.log_to_ui("🔞 Режим 18+ (POT)")
             self._ensure_pot_server()
@@ -721,43 +726,81 @@ class KaraokeApp:
                 'extractor_args': {'youtube': {'player_client': ['web_creator']}},
                 'source_address': '0.0.0.0',
             })
-        else:
-            self.log_to_ui("🟢 Обычный режим")
+        elif use_cookies:
+            # Если включены куки, android не работает. Используем web и ios.
+            self.log_to_ui("🟢 Обычный режим (с куками)")
             ydl_opts.update({
-                'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
+                'extractor_args': {'youtube': {'player_client': ['web', 'ios']}}
+            })
+        else:
+            # android/ios требуют PO-token и часто не отдают форматы — web надёжнее
+            self.log_to_ui("🟢 Обычный режим (без куки)")
+            ydl_opts.update({
+                'extractor_args': {'youtube': {'player_client': ['web', 'ios', 'android']}}
             })
 
         if self.proxy_url:
-            ydl_opts['proxy'] = self.proxy_url.replace('socks5h://', 'socks5://')
+            ydl_opts['proxy'] = self.proxy_url
 
         try:
             self.log_to_ui(f"📥 Запуск скачивания: {video_id}")
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                temp_path = None
-                if info.get('requested_downloads'):
-                    temp_path = info['requested_downloads'][0].get('filepath')
-                if not temp_path or not os.path.exists(temp_path):
-                    candidates = [os.path.join(self.temp_dir, f) for f in os.listdir(self.temp_dir) if f.endswith(('.mp4', '.mkv', '.webm'))]
-                    if candidates: temp_path = max(candidates, key=os.path.getsize)
-                if not temp_path or not os.path.exists(temp_path):
-                    raise Exception("Файл не найден")
-                
-                new_name = f"{self._get_next_number():02d} - {os.path.basename(temp_path)}"
-                dest = os.path.join(self.download_folder, new_name)
-                shutil.move(temp_path, dest)
-                self.video_cache[video_id] = dest
-                self._save_cache()
-                
-                if auto_play:
-                    self.root.after(0, lambda: self._play_local(dest))
-                else:
-                    self.root.after(0, lambda: self.status_lbl.config(text=f"Сохранено: {new_name}", fg="#00cc66"))
-                    self.log_to_ui(f"✅ Сохранено: {new_name}")
-                
+            temp_path = self._download_with_fallback(ydl_opts, fmt, url)
+            if not temp_path:
+                raise Exception("Файл не найден")
+            dest = os.path.join(self.download_folder, f"{self._get_next_number():02d} - {os.path.basename(temp_path)}")
+            shutil.move(temp_path, dest)
+            self.video_cache[video_id] = dest
+            self._save_cache()
+
+            if auto_play:
+                self.root.after(0, lambda: self._play_local(dest))
+            else:
+                self.root.after(0, lambda: self.status_lbl.config(text=f"Сохранено: {os.path.basename(dest)}", fg="#00cc66"))
+                self.log_to_ui(f"✅ Сохранено: {os.path.basename(dest)}")
+
         except Exception as e:
             self.log_to_ui(f"❌ ОШИБКА: {e}")
             self.root.after(0, lambda err=str(e): self.status_lbl.config(text=f"Ошибка: {err}", fg="red"))
+
+    def _download_with_fallback(self, ydl_opts, fmt, url):
+        attempts = [
+            ("настройка", {'format': fmt}),
+            ("формат 18", {'format': '18'}),
+            ("лучшее связное", {'format': 'b', 'format_sort': ['res:480']}),
+        ]
+        if self.config.get("use_cookies", False):
+            attempts.append(("HLS-поток", {'format': 'bv*+ba/b', 'extractor_args': {'youtube': {'player_client': ['web', 'ios']}}}))
+        last_err = None
+        for name, extra in attempts:
+            opts = dict(ydl_opts)
+            opts.update(extra)
+            opts['format_sort'] = opts.get('format_sort') or ['proto:https']
+            if name != "HLS-поток":
+                opts.setdefault('format_sort', ['proto:https'])
+            try:
+                if name != "настройка":
+                    self.log_to_ui(f"🔁 Попытка: {name}")
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                path = None
+                for rd in info.get('requested_downloads') or []:
+                    if rd.get('filepath') and os.path.exists(rd['filepath']):
+                        path = rd['filepath']
+                if not path:
+                    candidates = [os.path.join(self.temp_dir, f) for f in os.listdir(self.temp_dir)
+                                  if f.endswith(('.mp4', '.mkv', '.webm', '.m4a', '.mp3'))]
+                    if candidates:
+                        path = max(candidates, key=os.path.getsize)
+                if path and os.path.exists(path) and os.path.getsize(path) > 0:
+                    return path
+            except Exception as e:
+                last_err = e
+                self.log_to_ui(f"⚠️ {name}: {str(e).splitlines()[0][:120]}")
+                for f in os.listdir(self.temp_dir):
+                    try: os.remove(os.path.join(self.temp_dir, f))
+                    except Exception: pass
+        raise Exception(str(last_err).splitlines()[0] if last_err else "скачивание не удалось")
+
 
     def _get_screens(self):
         if not IS_MAC: return None
@@ -869,7 +912,7 @@ class KaraokeApp:
                 'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
             }
             if self.proxy_url: 
-                opts['proxy'] = self.proxy_url.replace('socks5h://', 'socks5://')
+                opts['proxy'] = self.proxy_url
             
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(f"ytsearch15:{search_query}", download=False)
