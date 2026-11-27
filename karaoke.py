@@ -36,7 +36,7 @@ except Exception as e:
 
 TPWS_PROXY = "socks5h://127.0.0.1:9876"
 TPWS_PORT = 9876
-APP_VERSION = "1.0.31"
+APP_VERSION = "1.0.32"
 GITHUB_REPO = "SteepCanyon/karaoke.py"
 
 def resource_path(relative_path):
@@ -167,6 +167,7 @@ class KaraokeApp:
 
     def _load_config(self):
         defaults = {
+            "auto_mode": True,
             "use_cookies": False,
             "use_pot": False,
             "strategy": ["--split-pos=midsld", "--oob"],
@@ -239,8 +240,8 @@ class KaraokeApp:
             self.log_to_ui(f"❌ Ошибка POT: {e}")
             return False
 
-    def _get_cookie_opt(self):
-        if not self.config.get("use_cookies", False):
+    def _get_cookie_opt(self, force=False):
+        if not force and not self.config.get("use_cookies", False):
             return {}
         source = self.config.get("cookie_source", "chrome")
         if source == "file":
@@ -400,6 +401,14 @@ class KaraokeApp:
                        variable=self.extended_search_var, 
                        bg=bg, fg=fg, selectcolor=entry_bg, activebackground=bg, activeforeground=fg).pack(anchor=tk.W, pady=(0, 15))
 
+        self.auto_mode_var = tk.BooleanVar(value=self.config.get("auto_mode", True))
+        self.auto_check = tk.Checkbutton(
+            frame, text="🔄 Авто-режим (простой → куки → 18+)",
+            variable=self.auto_mode_var, command=self._toggle_auto_mode,
+            bg=bg, fg=fg, selectcolor=entry_bg, activebackground=bg, activeforeground=fg,
+            font=("Segoe UI", 10, "bold"))
+        self.auto_check.pack(anchor=tk.W, pady=(0, 10))
+
         self.use_cookies_var = tk.BooleanVar(value=self.config.get("use_cookies", False))
         self.cookies_check = tk.Checkbutton(
             frame, text="🔓 Обход ограничений YouTube (включить куки)", 
@@ -439,6 +448,8 @@ class KaraokeApp:
         if self.use_cookies_var.get():
             self.cookie_options_frame.pack(fill=tk.X, pady=(0, 15))
 
+        self._toggle_auto_mode()
+
         tk.Label(frame, text="Папка для скачивания:", fg=fg, bg=bg, font=("Segoe UI", 10, "bold")).pack(anchor=tk.W, pady=(0, 5))
         folder_frame = tk.Frame(frame, bg=bg)
         folder_frame.pack(fill=tk.X, pady=(0, 15))
@@ -468,6 +479,17 @@ class KaraokeApp:
         tk.Label(frame, text=f"Версия: {APP_VERSION}", fg="#888", bg=bg).pack(anchor=tk.W)
         tk.Button(frame, text="🌐 GitHub", bg="#333", fg=fg, relief=tk.FLAT, command=lambda: webbrowser.open(f"https://github.com/{GITHUB_REPO}")).pack(anchor=tk.W, pady=(5, 0))
 
+    def _toggle_auto_mode(self):
+        auto = self.auto_mode_var.get()
+        state = tk.DISABLED if auto else tk.NORMAL
+        self.cookies_check.config(state=state)
+        self.pot_check.config(state=state)
+        if auto:
+            self.cookie_combo.config(state="readonly")
+            self.cookie_options_frame.pack(fill=tk.X, pady=(0, 15), after=self.cookies_check)
+        else:
+            self._toggle_cookie_options()
+
     def _toggle_cookie_options(self):
         if self.use_cookies_var.get():
             self.cookie_options_frame.pack(fill=tk.X, pady=(0, 15), after=self.cookies_check)
@@ -492,6 +514,7 @@ class KaraokeApp:
         self.config = self._load_config()
         
         # Обновляем UI
+        self.auto_mode_var.set(self.config.get("auto_mode", True))
         self.use_cookies_var.set(self.config.get("use_cookies", False))
         self.use_pot_var.set(self.config.get("use_pot", False))
         self.extended_search_var.set(self.config.get("extended_search", True))
@@ -510,13 +533,14 @@ class KaraokeApp:
             else: self.proxy_url = None
             self.update_zapret_status()
 
-        self._toggle_cookie_options()
+        self._toggle_auto_mode()
         messagebox.showinfo("Готово", "Настройки сброшены! Попробуй поиск и скачивание снова.")
 
     def _save_settings(self):
         old_strategy = self.config.get("strategy")
         old_folder = self.download_folder
 
+        self.config["auto_mode"] = self.auto_mode_var.get()
         self.config["use_cookies"] = self.use_cookies_var.get()
         self.config["use_pot"] = self.use_pot_var.get()
         self.config["strategy"] = self.strategies_map.get(self.strategy_var.get(), ["--split-pos=midsld", "--oob"])
@@ -687,6 +711,42 @@ class KaraokeApp:
         elif d['status'] == 'finished':
             self.log_to_ui("🔗 Завершено, склеиваем...")
 
+    def _build_profiles(self):
+        pot_opts = {
+            'remote_components': ['ejs:github'],
+            'source_address': '0.0.0.0',
+        }
+        cookie_opt = self._get_cookie_opt(force=True)
+
+        if not self.config.get("auto_mode", True):
+            use_cookies = self.config.get("use_cookies", False)
+            use_pot = self.config.get("use_pot", False)
+            opts = {}
+            clients = ['web', 'ios', 'android']
+            name = "простой"
+            if use_cookies:
+                opts.update(self._get_cookie_opt())
+                clients = ['web', 'ios']
+                name = "куки"
+            if use_pot:
+                opts.update(pot_opts)
+                clients = ['web_creator']
+                name = "18+"
+            opts['extractor_args'] = {'youtube': {'player_client': clients}}
+            return [(name, opts, use_pot)]
+
+        profiles = [("простой", {'extractor_args': {'youtube': {'player_client': ['web', 'ios', 'android']}}}, False)]
+        if cookie_opt:
+            opts = dict(cookie_opt)
+            opts['extractor_args'] = {'youtube': {'player_client': ['web', 'ios']}}
+            profiles.append(("куки", opts, False))
+        if self.node_server_dir:
+            opts = dict(pot_opts)
+            opts.update(cookie_opt)
+            opts['extractor_args'] = {'youtube': {'player_client': ['web_creator']}}
+            profiles.append(("18+", opts, True))
+        return profiles
+
     def _download(self, video_id, auto_play):
         url = f"https://youtu.be/{video_id}"
         outtmpl = os.path.join(self.temp_dir, '%(title)s.%(ext)s')
@@ -696,58 +756,50 @@ class KaraokeApp:
             except Exception: pass
 
         fmt = self.config.get("format", "bv*+ba/b")
-        use_pot = self.config.get("use_pot", False)
-        use_cookies = self.config.get("use_cookies", False)
         
-        ydl_opts = {
+        base_opts = {
             'quiet': True,
             'outtmpl': outtmpl,
             'nopart': True,
             'progress_hooks': [self._progress_hook],
             'socket_timeout': 30,                   # Таймаут 30 сек
-            'retries': 10,                          # 10 попыток при обрыве
+            'retries': 3,                           # 3 попытки при обрыве, дальше — следующий формат
             'fragment_retries': 20,
             'http_chunk_size': 2097152,            # Качаем кусками по 2 МБ (лечит обрывы)
             'check_formats': 'selected',           # не брать форматы без прямого URL
             'concurrent_fragment_downloads': 4,    # HLS: 4 куска параллельно
         }
-        
-        if use_cookies:
-            cookie_opt = self._get_cookie_opt()
-            if cookie_opt:
-                ydl_opts.update(cookie_opt)
-                self.log_to_ui(f"🍪 Куки: {list(cookie_opt.keys())[0]}")
-        
-        # Настраиваем клиентов в зависимости от режима
-        if use_pot:
-            self.log_to_ui("🔞 Режим 18+ (POT)")
-            self._ensure_pot_server()
-            ydl_opts.update({
-                'remote_components': ['ejs:github'],
-                'extractor_args': {'youtube': {'player_client': ['web_creator']}},
-                'source_address': '0.0.0.0',
-            })
-        elif use_cookies:
-            # Если включены куки, android не работает. Используем web и ios.
-            self.log_to_ui("🟢 Обычный режим (с куками)")
-            ydl_opts.update({
-                'extractor_args': {'youtube': {'player_client': ['web', 'ios']}}
-            })
-        else:
-            # android/ios требуют PO-token и часто не отдают форматы — web надёжнее
-            self.log_to_ui("🟢 Обычный режим (без куки)")
-            ydl_opts.update({
-                'extractor_args': {'youtube': {'player_client': ['web', 'ios', 'android']}}
-            })
 
         if self.proxy_url:
-            ydl_opts['proxy'] = self.proxy_url
+            base_opts['proxy'] = self.proxy_url
 
         try:
             self.log_to_ui(f"📥 Запуск скачивания: {video_id}")
-            temp_path = self._download_with_fallback(ydl_opts, fmt, url)
+            temp_path = None
+            last_err = None
+            for name, extra, needs_pot in self._build_profiles():
+                if needs_pot and not self._ensure_pot_server():
+                    self.log_to_ui("⚠️ POT сервер недоступен — пропускаю 18+")
+                    continue
+                opts = dict(base_opts)
+                opts.update(extra)
+                self.log_to_ui(f"🎛 Режим: {name}")
+                try:
+                    temp_path = self._download_with_fallback(opts, fmt, url)
+                    if temp_path:
+                        break
+                except Exception as e:
+                    last_err = e
+                    msg = str(e)
+                    self.log_to_ui(f"⚠️ Режим «{name}»: {msg.splitlines()[0][:120]}")
+                    for f in os.listdir(self.temp_dir):
+                        try: os.remove(os.path.join(self.temp_dir, f))
+                        except Exception: pass
+                    if self._is_fatal(msg):
+                        break
             if not temp_path:
-                raise Exception("Файл не найден")
+                raise Exception(self._friendly_error(last_err))
+
             dest = os.path.join(self.download_folder, f"{self._get_next_number():02d} - {os.path.basename(temp_path)}")
             shutil.move(temp_path, dest)
             self.video_cache[video_id] = dest
@@ -763,21 +815,42 @@ class KaraokeApp:
             self.log_to_ui(f"❌ ОШИБКА: {e}")
             self.root.after(0, lambda err=str(e): self.status_lbl.config(text=f"Ошибка: {err}", fg="red"))
 
+    FATAL_MARKERS = (
+        'private video', 'video unavailable', 'this video is unavailable',
+        'not available in your country', 'members-only', 'has been removed',
+        'account has been terminated',
+    )
+
+    def _is_fatal(self, text):
+        low = str(text).lower()
+        return any(m in low for m in self.FATAL_MARKERS)
+
+    def _friendly_error(self, err):
+        low = str(err or "").lower()
+        if 'requested format is not available' in low:
+            return "YouTube не отдаёт поток для этого видео. Попробуйте позже или другое видео"
+        if 'sign in to confirm' in low:
+            return "Нужна авторизация YouTube — включите куки или режим 18+"
+        if '403' in low:
+            return "YouTube отклонил загрузку (403). Попробуйте позже"
+        if 'not available in your country' in low:
+            return "Видео недоступно в вашем регионе"
+        text = str(err or "").splitlines()
+        return text[0][:160] if text else "скачивание не удалось"
+
     def _download_with_fallback(self, ydl_opts, fmt, url):
         attempts = [
             ("настройка", {'format': fmt}),
             ("формат 18", {'format': '18'}),
             ("лучшее связное", {'format': 'b', 'format_sort': ['res:480']}),
         ]
-        if self.config.get("use_cookies", False):
-            attempts.append(("HLS-поток", {'format': 'bv*+ba/b', 'extractor_args': {'youtube': {'player_client': ['web', 'ios']}}}))
+        if any(k in ydl_opts for k in ('cookiefile', 'cookiesfrombrowser')) or self.config.get("use_cookies", False):
+            attempts.append(("HLS-поток", {'format': 'b[protocol^=m3u8]/bv*+ba/b'}))
         last_err = None
         for name, extra in attempts:
             opts = dict(ydl_opts)
             opts.update(extra)
             opts['format_sort'] = opts.get('format_sort') or ['proto:https']
-            if name != "HLS-поток":
-                opts.setdefault('format_sort', ['proto:https'])
             try:
                 if name != "настройка":
                     self.log_to_ui(f"🔁 Попытка: {name}")
@@ -796,10 +869,14 @@ class KaraokeApp:
                     return path
             except Exception as e:
                 last_err = e
-                self.log_to_ui(f"⚠️ {name}: {str(e).splitlines()[0][:120]}")
+                msg = str(e)
+                self.log_to_ui(f"⚠️ {name}: {msg.splitlines()[0][:120]}")
                 for f in os.listdir(self.temp_dir):
                     try: os.remove(os.path.join(self.temp_dir, f))
                     except Exception: pass
+                low = msg.lower()
+                if 'requested format is not available' in low or self._is_fatal(low):
+                    break
         raise Exception(str(last_err).splitlines()[0] if last_err else "скачивание не удалось")
 
 
